@@ -7,6 +7,10 @@ from .residual_mean_reversion import ResidualMeanReversionStrategy
 from .donchian_breakout import DonchianBreakoutStrategy
 from .blended_momentum_mr import BlendedMomentumMRStrategy
 from .btc_momentum_breakout import BTCMomentumBreakoutStrategy
+from .rsi_bollinger import RSIBollingerStrategy
+from .macd_momentum import MACDMomentumStrategy
+from .ema_crossover import EMACrossoverStrategy
+from .breakout import BreakoutStrategy
 
 ALL_STRATEGIES = [
     EMA5MomentumStrategy,           # 1 – Short-window EMA momentum     (~145% CAGR)
@@ -17,4 +21,10 @@ ALL_STRATEGIES = [
     DonchianBreakoutStrategy,        # 6 – Donchian breakout + inverse ADX (competitive)
     BlendedMomentumMRStrategy,      # 7 – 50/50 momentum + MR blend      (best risk-adj)
     BTCMomentumBreakoutStrategy,    # 8 – BTC momentum breakout          (+42% CAGR vault)
+    RSIBollingerStrategy,           # 9 – RSI + Bollinger mean reversion (clásica)
+    MACDMomentumStrategy,           # 10 – MACD a favor de EMA 200       (clásica)
+    EMACrossoverStrategy,           # 11 – Cruce EMA 9/21                (clásica)
+    BreakoutStrategy,               # 12 – Ruptura con volumen           (clásica)
 ]
+# MLAdaptiveStrategy no se registra: solo aprende de trades cerrados en vivo y en un
+# backtest quedaría reducida a una regla fija; además lee/guarda un modelo en disco.

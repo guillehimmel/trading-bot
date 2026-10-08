@@ -126,3 +126,23 @@ STRATEGY_PARAMS = {
         "candle_interval":  "1d",
     },
 }
+
+# Estrategias "clásicas" del bot original. Sus parámetros NO venían definidos
+# (el config original solo traía las 8 nuevas), así que estos valores son
+# convencionales, elegidos acá, y no están optimizados.
+STRATEGY_PARAMS.update({
+    "RSI_Bollinger": {   # mean reversion: RSI extremo + banda de Bollinger
+        "rsi_period": 14, "rsi_oversold": 30, "rsi_overbought": 70,
+        "bb_period": 20, "candle_interval": "4h",
+    },
+    "MACD_Momentum": {   # cruce de MACD a favor de la tendencia (EMA 200)
+        "trend_ema": 200, "candle_interval": "1h",
+    },
+    "EMA_Crossover": {   # cruce EMA 9/21 con filtro EMA 50
+        "trend_ema": 50, "candle_interval": "1h",
+    },
+    "Breakout": {        # ruptura del máximo/mínimo con volumen
+        "lookback": 24, "atr_period": 14, "volume_multiplier": 1.5,
+        "candle_interval": "4h",
+    },
+})

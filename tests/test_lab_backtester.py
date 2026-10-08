@@ -23,7 +23,7 @@ def _synthetic(n=900, seed=1):
 def test_all_registered_strategies_run_and_never_short():
     assert params.ALLOW_SHORT is False
     df = _synthetic()
-    assert len(ALL_STRATEGIES) >= 8
+    assert len(ALL_STRATEGIES) == 12
     for cls in ALL_STRATEGIES:
         result = Backtester(cls(), df).run()
         assert all(t.side == "LONG" for t in result.trades), cls.__name__
