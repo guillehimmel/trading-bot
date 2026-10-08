@@ -1,0 +1,1264 @@
+"""
+Multi-indicator confluence signal scorer.
+
+Combines signals from multiple technical indicators to generate
+a composite trading signal score from -100 (strong sell) to +100 (strong buy).
+
+Trade execution requires score magnitude >= threshold (default: 60).
+"""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Literal, Optional
+
+import pandas as pd
+import structlog
+
+from src.indicators.rsi import calculate_rsi, get_rsi_signal_graduated
+from src.indicators.macd import calculate_macd, get_macd_signal_graduated, VALID_CANDLE_INTERVALS
+from src.indicators.bollinger import calculate_bollinger_bands, get_bollinger_signal_graduated
+from src.indicators.ema import calculate_ema_crossover, get_ema_signal_graduated, get_ema_trend
+from src.indicators.atr import calculate_atr, get_volatility_level
+from src.indicators.vwap import get_vwap_signal_graduated, calculate_price_vs_vwap_percent
+from src.indicators.adx import (
+    calculate_adx,
+    get_adx_confidence_multiplier,
+    classify_trend_strength,
+)
+
+logger = structlog.get_logger(__name__)
+
+# Type alias for sentiment categories from Fear & Greed Index
+SentimentCategory = Literal["extreme_fear", "fear", "neutral", "greed", "extreme_greed"]
+
+# Recommended signal thresholds by candle interval
+# Shorter candles capture faster moves, so lower thresholds are appropriate
+# Longer candles require higher conviction, so higher thresholds are better
+_RECOMMENDED_THRESHOLDS = {
+    "ONE_MINUTE": 50,       # Ultra-short term - catch fast moves
+    "FIVE_MINUTE": 52,      # Very short term
+    "FIFTEEN_MINUTE": 55,   # Day trading
+    "THIRTY_MINUTE": 57,    # Intraday swing
+    "ONE_HOUR": 58,         # Swing trading
+    "TWO_HOUR": 60,         # Swing trading - balanced
+    "SIX_HOUR": 62,         # Position trading
+    "ONE_DAY": 65,          # Position trading - high conviction
+}
+_DEFAULT_THRESHOLD = 60
+
+
+def get_recommended_threshold(candle_interval: Optional[str] = None) -> int:
+    """
+    Get recommended signal threshold for the given candle interval.
+
+    Shorter candles have smaller price movements and faster reversals,
+    so lower thresholds help catch more opportunities. Longer candles
+    have more significant moves that warrant higher conviction thresholds.
+
+    Args:
+        candle_interval: Candle interval string (e.g., "FIFTEEN_MINUTE", "ONE_HOUR").
+                        If None, returns the default threshold.
+
+    Returns:
+        Recommended threshold value (50-65 depending on interval).
+
+    Example:
+        >>> get_recommended_threshold("FIFTEEN_MINUTE")
+        55
+        >>> get_recommended_threshold("ONE_DAY")
+        65
+    """
+    if candle_interval is None:
+        return _DEFAULT_THRESHOLD
+    if candle_interval not in VALID_CANDLE_INTERVALS:
+        logger.warning(
+            "invalid_candle_interval",
+            interval=candle_interval,
+            using="default",
+            valid_intervals=list(VALID_CANDLE_INTERVALS)
+        )
+    return _RECOMMENDED_THRESHOLDS.get(candle_interval, _DEFAULT_THRESHOLD)
+
+
+@dataclass
+class SignalWeights:
+    """Weights for each indicator in the composite score."""
+
+    rsi: int = 25
+    macd: int = 25
+    bollinger: int = 20
+    ema: int = 15
+    volume: int = 15
+
+
+@dataclass
+class IndicatorValues:
+    """Current values of all indicators."""
+
+    rsi: Optional[float] = None
+    macd_line: Optional[float] = None
+    macd_signal: Optional[float] = None
+    macd_histogram: Optional[float] = None
+    bb_upper: Optional[float] = None
+    bb_middle: Optional[float] = None
+    bb_lower: Optional[float] = None
+    ema_fast: Optional[float] = None
+    ema_slow: Optional[float] = None
+    atr: Optional[float] = None
+    volatility: str = "normal"
+    # VWAP enrichment data (from Kraken public API)
+    vwap: Optional[float] = None
+    price_vs_vwap_pct: Optional[float] = None
+    trade_count: Optional[int] = None
+    # ADX (trend strength)
+    adx: Optional[float] = None
+    plus_di: Optional[float] = None
+    minus_di: Optional[float] = None
+
+
+@dataclass
+class SignalResult:
+    """Result of signal calculation."""
+
+    score: int  # -100 to +100
+    action: str  # "buy", "sell", or "hold"
+    indicators: IndicatorValues
+    components: dict[str, int]  # Score contributions only (rsi, macd, bollinger, ema, volume, trend_filter, htf_bias)
+    metadata: dict[str, Any]  # Raw values, flags, ratios (_rsi_value, _whale_activity, _htf_trend, etc.)
+    confidence: float  # 0.0 to 1.0
+
+    @property
+    def breakdown(self) -> dict[str, Any]:
+        """
+        Backward compatibility property combining components and metadata.
+
+        Returns:
+            Combined dict with all score components and metadata keys.
+        """
+        return {**self.components, **self.metadata}
+
+
+class SignalScorer:
+    """
+    Confluence-based signal scoring system.
+
+    Combines multiple indicators to generate a trading signal:
+    - RSI: Momentum and overbought/oversold
+    - MACD: Trend direction and momentum
+    - Bollinger Bands: Volatility and mean reversion
+    - EMA Crossover: Short-term trend
+    - Volume: Confirmation of moves
+
+    Each indicator contributes a weighted score. Trades execute when
+    the total score exceeds the threshold.
+    """
+
+    # Price tolerance for validating OHLC data consistency
+    # Financial data can have minor discrepancies due to bid/ask spreads, timestamp
+    # differences, or exchange rounding. Epsilon is calculated as candle_range * 1e-6,
+    # which for a typical $1000 BTC candle range allows ~$0.001 tolerance.
+    # This tight tolerance ensures conservative handling of inconsistent data.
+    PRICE_TOLERANCE_EPSILON = 1e-6
+
+    def __init__(
+        self,
+        weights: Optional[SignalWeights] = None,
+        threshold: int = 60,
+        rsi_period: int = 14,
+        rsi_oversold: float = 35.0,
+        rsi_overbought: float = 65.0,
+        macd_fast: int = 12,
+        macd_slow: int = 26,
+        macd_signal: int = 9,
+        bollinger_period: int = 20,
+        bollinger_std: float = 2.0,
+        ema_fast: int = 9,
+        ema_slow: int = 21,
+        atr_period: int = 14,
+        momentum_rsi_threshold: float = 60.0,
+        momentum_rsi_candles: int = 3,
+        momentum_price_candles: int = 12,
+        momentum_penalty_reduction: float = 0.5,
+        momentum_trend_strength_cap: float = 5.0,
+        candle_interval: Optional[str] = None,
+        trading_pair: Optional[str] = None,
+        whale_volume_threshold: float = 3.0,
+        whale_direction_threshold: float = 0.003,
+        whale_candle_bullish_threshold: float = 0.7,
+        whale_candle_bearish_threshold: float = 0.3,
+        whale_boost_percent: float = 0.30,
+        high_volume_boost_percent: float = 0.20,
+        mtf_aligned_boost: int = 20,
+        mtf_counter_penalty: int = 20,
+        max_oversold_buys_24h: int = 2,
+        price_stabilization_window: int = 12,
+        volume_sma_window: int = 20,
+        high_volume_threshold: float = 1.5,
+        low_volume_threshold: float = 0.7,
+        low_volume_penalty: int = 10,
+        extreme_rsi_lower: int = 25,
+        extreme_rsi_upper: int = 75,
+        trend_filter_penalty: int = 20,
+        macd_interval_multipliers: Optional[dict[str, float]] = None,
+        vwap_weight: int = 0,
+        vwap_threshold_percent: float = 0.5,
+        adx_enabled: bool = True,
+        adx_period: int = 14,
+        adx_weak_threshold: float = 20.0,
+        adx_strong_threshold: float = 25.0,
+    ):
+        """
+        Initialize signal scorer.
+
+        Args:
+            weights: Weights for each indicator
+            threshold: Minimum score to trigger trade
+            momentum_rsi_threshold: RSI must stay above this for momentum mode (default: 60)
+            momentum_rsi_candles: Number of candles RSI must stay elevated (default: 3)
+            momentum_price_candles: Number of candles to check for higher lows (default: 12)
+            momentum_penalty_reduction: Factor to reduce overbought penalties (default: 0.5 = 50%)
+            momentum_trend_strength_cap: EMA gap percentage cap for trend strength normalization (default: 5.0)
+                                        Stronger trends (wider EMA gap) get more penalty reduction.
+                                        Increase for volatile markets (10-15%), decrease for stable (3%)
+            candle_interval: Candle interval for adaptive MACD scaling
+                            (e.g., "FIFTEEN_MINUTE", "ONE_HOUR")
+            trading_pair: Trading pair symbol (e.g., "BTC-USD") for logging context
+            *: Other indicator parameters
+
+        Recommended thresholds by candle interval:
+            - ONE_MINUTE to FIFTEEN_MINUTE (daytrading): 50-55 (catch faster moves)
+            - THIRTY_MINUTE to TWO_HOUR (swing): 55-60 (balanced)
+            - SIX_HOUR to ONE_DAY (position): 60-65 (higher conviction)
+        """
+        self.weights = weights or SignalWeights()
+        self.threshold = threshold
+
+        # Crash protection: track oversold buys
+        self._oversold_buy_times: list[datetime] = []
+
+        # Indicator parameters
+        self.rsi_period = rsi_period
+        self.rsi_oversold = rsi_oversold
+        self.rsi_overbought = rsi_overbought
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal_period = macd_signal
+        self.bollinger_period = bollinger_period
+        self.bollinger_std = bollinger_std
+        self.ema_fast = ema_fast
+        self.ema_slow_period = ema_slow
+        self.atr_period = atr_period
+        self.candle_interval = candle_interval
+        self.trading_pair = trading_pair or "UNKNOWN"
+
+        # Momentum mode parameters
+        self.momentum_rsi_threshold = momentum_rsi_threshold
+        self.momentum_rsi_candles = momentum_rsi_candles
+        self.momentum_price_candles = momentum_price_candles
+        self.momentum_penalty_reduction = momentum_penalty_reduction
+        self.momentum_trend_strength_cap = momentum_trend_strength_cap
+
+        # Whale detection parameters
+        self.whale_volume_threshold = whale_volume_threshold
+        self.whale_direction_threshold = whale_direction_threshold
+        self.whale_candle_bullish_threshold = whale_candle_bullish_threshold
+        self.whale_candle_bearish_threshold = whale_candle_bearish_threshold
+        self.whale_boost_percent = whale_boost_percent
+        self.high_volume_boost_percent = high_volume_boost_percent
+
+        # Multi-Timeframe confirmation parameters
+        self.mtf_aligned_boost = mtf_aligned_boost
+        self.mtf_counter_penalty = mtf_counter_penalty
+
+        # Crash protection parameters
+        self.max_oversold_buys_24h = max_oversold_buys_24h
+        self.price_stabilization_window = price_stabilization_window
+        self.extreme_rsi_lower = extreme_rsi_lower
+        self.extreme_rsi_upper = extreme_rsi_upper
+
+        # Volume analysis parameters
+        self.volume_sma_window = volume_sma_window
+        self.high_volume_threshold = high_volume_threshold
+        self.low_volume_threshold = low_volume_threshold
+        self.low_volume_penalty = low_volume_penalty
+
+        # Trend filter parameters
+        self.trend_filter_penalty = trend_filter_penalty
+
+        # MACD dynamic scaling parameters
+        self.macd_interval_multipliers = macd_interval_multipliers
+
+        # VWAP enrichment parameters
+        self.vwap_weight = vwap_weight
+        self.vwap_threshold_percent = vwap_threshold_percent
+
+        # ADX (trend strength) parameters
+        self.adx_enabled = adx_enabled
+        self.adx_period = adx_period
+        self.adx_weak_threshold = adx_weak_threshold
+        self.adx_strong_threshold = adx_strong_threshold
+
+    def get_min_candles(self) -> int:
+        """
+        Get minimum number of candles required for indicator calculations.
+
+        Returns the maximum of all indicator periods to ensure sufficient
+        historical data for accurate signal calculation.
+
+        Returns:
+            Minimum number of candles needed for all indicators
+
+        Example:
+            >>> scorer = SignalScorer(ema_slow=21, bollinger_period=20)
+            >>> scorer.get_min_candles()
+            26
+        """
+        return max(
+            self.ema_slow_period,
+            self.bollinger_period,
+            self.macd_slow,  # MACD slow period (26 by default)
+            self.rsi_period,
+            self.atr_period,
+        )
+
+    def update_settings(
+        self,
+        threshold: Optional[int] = None,
+        whale_volume_threshold: Optional[float] = None,
+        whale_direction_threshold: Optional[float] = None,
+        whale_candle_bullish_threshold: Optional[float] = None,
+        whale_candle_bearish_threshold: Optional[float] = None,
+        whale_boost_percent: Optional[float] = None,
+        high_volume_boost_percent: Optional[float] = None,
+        rsi_period: Optional[int] = None,
+        rsi_oversold: Optional[float] = None,
+        rsi_overbought: Optional[float] = None,
+        macd_fast: Optional[int] = None,
+        macd_slow: Optional[int] = None,
+        macd_signal: Optional[int] = None,
+        bollinger_period: Optional[int] = None,
+        bollinger_std: Optional[float] = None,
+        ema_fast: Optional[int] = None,
+        ema_slow: Optional[int] = None,
+        atr_period: Optional[int] = None,
+        momentum_rsi_threshold: Optional[float] = None,
+        momentum_rsi_candles: Optional[int] = None,
+        momentum_price_candles: Optional[int] = None,
+        momentum_penalty_reduction: Optional[float] = None,
+        candle_interval: Optional[str] = None,
+        mtf_aligned_boost: Optional[int] = None,
+        mtf_counter_penalty: Optional[int] = None,
+    ) -> None:
+        """
+        Update scorer settings at runtime.
+
+        Only updates parameters that are explicitly provided (not None).
+        """
+        if threshold is not None:
+            self.threshold = threshold
+        if whale_volume_threshold is not None:
+            self.whale_volume_threshold = whale_volume_threshold
+        if whale_direction_threshold is not None:
+            self.whale_direction_threshold = whale_direction_threshold
+        if whale_candle_bullish_threshold is not None:
+            self.whale_candle_bullish_threshold = whale_candle_bullish_threshold
+        if whale_candle_bearish_threshold is not None:
+            self.whale_candle_bearish_threshold = whale_candle_bearish_threshold
+        if whale_boost_percent is not None:
+            self.whale_boost_percent = whale_boost_percent
+        if high_volume_boost_percent is not None:
+            self.high_volume_boost_percent = high_volume_boost_percent
+        if rsi_period is not None:
+            self.rsi_period = rsi_period
+        if rsi_oversold is not None:
+            self.rsi_oversold = rsi_oversold
+        if rsi_overbought is not None:
+            self.rsi_overbought = rsi_overbought
+        if macd_fast is not None:
+            self.macd_fast = macd_fast
+        if macd_slow is not None:
+            self.macd_slow = macd_slow
+        if macd_signal is not None:
+            self.macd_signal_period = macd_signal
+        if bollinger_period is not None:
+            self.bollinger_period = bollinger_period
+        if bollinger_std is not None:
+            self.bollinger_std = bollinger_std
+        if ema_fast is not None:
+            self.ema_fast = ema_fast
+        if ema_slow is not None:
+            self.ema_slow_period = ema_slow
+        if atr_period is not None:
+            self.atr_period = atr_period
+        if momentum_rsi_threshold is not None:
+            self.momentum_rsi_threshold = momentum_rsi_threshold
+        if momentum_rsi_candles is not None:
+            self.momentum_rsi_candles = momentum_rsi_candles
+        if momentum_price_candles is not None:
+            self.momentum_price_candles = momentum_price_candles
+        if momentum_penalty_reduction is not None:
+            self.momentum_penalty_reduction = momentum_penalty_reduction
+        if candle_interval is not None:
+            self.candle_interval = candle_interval
+        if mtf_aligned_boost is not None:
+            self.mtf_aligned_boost = mtf_aligned_boost
+        if mtf_counter_penalty is not None:
+            self.mtf_counter_penalty = mtf_counter_penalty
+
+        logger.info("signal_scorer_settings_updated")
+
+    def update_weights(self, weights: SignalWeights) -> None:
+        """
+        Update indicator weights at runtime.
+
+        Used by AI weight profile selector to adjust weights based on market conditions.
+
+        Args:
+            weights: New SignalWeights to apply
+        """
+        self.weights = weights
+        logger.info(
+            "signal_weights_updated",
+            rsi=weights.rsi,
+            macd=weights.macd,
+            bollinger=weights.bollinger,
+            ema=weights.ema,
+            volume=weights.volume,
+        )
+
+    def is_momentum_mode(self, df: pd.DataFrame, rsi: pd.Series) -> tuple[bool, str]:
+        """
+        Detect if market is in sustained momentum mode.
+
+        Momentum mode is active when RSI has been elevated for multiple candles
+        and price structure shows higher lows (bullish continuation pattern).
+        When active, overbought penalties are reduced to allow riding trends.
+
+        Args:
+            df: DataFrame with OHLCV data
+            rsi: RSI series
+
+        Returns:
+            Tuple of (is_momentum_active, reason_string)
+        """
+        min_rsi_candles = self.momentum_rsi_candles
+        min_price_candles = self.momentum_price_candles
+
+        if len(rsi) < min_rsi_candles or len(df) < min_price_candles:
+            return False, ""
+
+        # Condition 1: RSI sustained above threshold for N candles
+        # Use dropna() to handle any NaN values in the RSI series
+        recent_rsi = rsi.tail(min_rsi_candles).dropna()
+        if len(recent_rsi) < min_rsi_candles:
+            # Not enough valid RSI values after dropping NaN
+            return False, ""
+        rsi_sustained = bool((recent_rsi > self.momentum_rsi_threshold).all())
+
+        # Condition 2: Price making higher lows (bullish structure)
+        # This checks if recent prices are staying above their local minimums,
+        # indicating buyers are stepping in at progressively higher levels.
+        close = df["close"].astype(float)
+        recent_close = close.tail(min_price_candles)
+
+        # Check for NaN in price data
+        if recent_close.isna().any():
+            return False, ""
+
+        higher_lows = True
+
+        # Iterate through recent candles (starting at index 3 to have a lookback window)
+        # For each candle at position i, compare its price to the minimum of the
+        # previous 3 candles. If current price <= that minimum, we're making lower lows.
+        # Note: i is relative to recent_close (last N candles), not the full DataFrame.
+        for i in range(3, len(recent_close)):
+            # Get minimum of the 3 candles before position i
+            lookback_start = max(0, i - 3)
+            window_min = recent_close.iloc[lookback_start:i].min()
+            # Current candle must be above the local minimum
+            if recent_close.iloc[i] <= window_min:
+                higher_lows = False
+                break
+
+        if rsi_sustained and higher_lows:
+            return True, "sustained_rsi_higher_lows"
+        elif rsi_sustained:
+            return True, "sustained_rsi"
+        return False, ""
+
+    def record_oversold_buy(self) -> None:
+        """Record an oversold buy for rate limiting during crashes."""
+        now = datetime.now(timezone.utc)
+        self._oversold_buy_times.append(now)
+        # Clean old entries
+        cutoff = now - timedelta(hours=24)
+        self._oversold_buy_times = [t for t in self._oversold_buy_times if t > cutoff]
+        logger.debug("oversold_buy_recorded", count=len(self._oversold_buy_times))
+
+    def can_buy_oversold(self) -> bool:
+        """Check if we can make another oversold buy (max per 24h)."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        recent_buys = [t for t in self._oversold_buy_times if t > cutoff]
+        return len(recent_buys) < self.max_oversold_buys_24h
+
+    def is_price_stabilized(self, close_prices: pd.Series, window_candles: Optional[int] = None) -> bool:
+        """
+        Check if price has stopped falling (stabilized).
+
+        Args:
+            close_prices: Series of closing prices
+            window_candles: Number of candles to check (uses self.price_stabilization_window if None)
+
+        Returns:
+            True if price is stable/recovering (not making new lows)
+        """
+        if window_candles is None:
+            window_candles = self.price_stabilization_window
+        if len(close_prices) < window_candles:
+            return True  # Not enough data, allow trade
+
+        recent = close_prices.tail(window_candles)
+        current = recent.iloc[-1]
+        min_in_window = recent.min()
+
+        # Stabilized if current price > minimum in window (not making new lows)
+        # Must be strictly greater - if current == min, we just made a new low
+        return current > min_in_window
+
+    def calculate_score(
+        self,
+        df: pd.DataFrame,
+        current_price: Optional[Decimal] = None,
+        htf_bias: Optional[str] = None,
+        htf_daily: Optional[str] = None,
+        htf_4h: Optional[str] = None,
+        sentiment_category: Optional[SentimentCategory] = None,
+        enrichment_data: Optional[pd.DataFrame] = None,
+    ) -> SignalResult:
+        """
+        Calculate composite signal score from OHLCV data.
+
+        Combines multiple technical indicators (RSI, MACD, Bollinger, EMA, Volume, VWAP) into
+        a unified signal. When momentum mode is active, overbought penalties are reduced
+        proportionally to trend strength (EMA gap) to enable riding strong trends while
+        maintaining responsiveness during weakening trends.
+
+        Args:
+            df: DataFrame with columns: open, high, low, close, volume
+            current_price: Current price (uses latest close if not provided)
+            htf_bias: Combined HTF bias ("bullish", "bearish", "neutral", or None)
+            htf_daily: Daily timeframe trend (for AI context)
+            htf_4h: 4-hour timeframe trend (for AI context)
+            sentiment_category: Fear & Greed category ("extreme_fear", "fear", etc.)
+            enrichment_data: Optional DataFrame with VWAP/trade count from Kraken enrichment.
+                           Expected columns: timestamp, vwap, trade_count.
+                           Uses latest row's VWAP for signal calculation.
+
+        Returns:
+            SignalResult with score, action, and breakdown
+        """
+        # Validate sentiment_category at runtime to ensure type safety in financial logic
+        if sentiment_category is not None and sentiment_category not in (
+            "extreme_fear", "fear", "neutral", "greed", "extreme_greed"
+        ):
+            logger.error(
+                "invalid_sentiment_category",
+                category=sentiment_category,
+                impact="extreme_fear_override_disabled",
+            )
+            sentiment_category = None  # Fail safe
+
+        if df.empty or len(df) < max(self.ema_slow_period, self.bollinger_period, 26):
+            return SignalResult(
+                score=0,
+                action="hold",
+                indicators=IndicatorValues(),
+                components={},
+                metadata={},
+                confidence=0.0,
+            )
+
+        # Get price series
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        volume = df["volume"].astype(float) if "volume" in df.columns else None
+
+        price = float(current_price) if current_price else close.iloc[-1]
+
+        # Calculate all indicators
+        rsi = calculate_rsi(close, self.rsi_period)
+        macd_result = calculate_macd(close, self.macd_fast, self.macd_slow, self.macd_signal_period)
+        bollinger = calculate_bollinger_bands(close, self.bollinger_period, self.bollinger_std)
+        ema_result = calculate_ema_crossover(close, self.ema_fast, self.ema_slow_period)
+        atr_result = calculate_atr(high, low, close, self.atr_period)
+
+        # Calculate ADX (trend strength) if enabled
+        adx_result = None
+        adx_value: Optional[float] = None
+        plus_di_value: Optional[float] = None
+        minus_di_value: Optional[float] = None
+        if self.adx_enabled:
+            adx_result = calculate_adx(high, low, close, self.adx_period)
+            if not adx_result.adx.empty and not pd.isna(adx_result.adx.iloc[-1]):
+                adx_value = float(adx_result.adx.iloc[-1])
+                plus_di_value = float(adx_result.plus_di.iloc[-1]) if not pd.isna(adx_result.plus_di.iloc[-1]) else None
+                minus_di_value = float(adx_result.minus_di.iloc[-1]) if not pd.isna(adx_result.minus_di.iloc[-1]) else None
+
+        # Extract VWAP enrichment data (from Kraken public API)
+        vwap_value: Optional[float] = None
+        trade_count_value: Optional[int] = None
+        if enrichment_data is not None and not enrichment_data.empty:
+            # Use the latest row's VWAP (most recent candle)
+            if "vwap" in enrichment_data.columns:
+                latest_vwap = enrichment_data["vwap"].iloc[-1]
+                if not pd.isna(latest_vwap):
+                    vwap_value = float(latest_vwap)
+            if "trade_count" in enrichment_data.columns:
+                latest_count = enrichment_data["trade_count"].iloc[-1]
+                if not pd.isna(latest_count):
+                    trade_count_value = int(latest_count)
+
+        # Store current indicator values
+        indicators = IndicatorValues(
+            rsi=rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else None,
+            macd_line=macd_result.macd_line.iloc[-1] if not pd.isna(macd_result.macd_line.iloc[-1]) else None,
+            macd_signal=macd_result.signal_line.iloc[-1] if not pd.isna(macd_result.signal_line.iloc[-1]) else None,
+            macd_histogram=macd_result.histogram.iloc[-1] if not pd.isna(macd_result.histogram.iloc[-1]) else None,
+            bb_upper=bollinger.upper_band.iloc[-1] if not pd.isna(bollinger.upper_band.iloc[-1]) else None,
+            bb_middle=bollinger.middle_band.iloc[-1] if not pd.isna(bollinger.middle_band.iloc[-1]) else None,
+            bb_lower=bollinger.lower_band.iloc[-1] if not pd.isna(bollinger.lower_band.iloc[-1]) else None,
+            ema_fast=ema_result.ema_fast.iloc[-1] if not pd.isna(ema_result.ema_fast.iloc[-1]) else None,
+            ema_slow=ema_result.ema_slow.iloc[-1] if not pd.isna(ema_result.ema_slow.iloc[-1]) else None,
+            atr=atr_result.atr.iloc[-1] if not pd.isna(atr_result.atr.iloc[-1]) else None,
+            volatility=get_volatility_level(atr_result),
+            vwap=vwap_value,
+            price_vs_vwap_pct=calculate_price_vs_vwap_percent(price, vwap_value),
+            trade_count=trade_count_value,
+            adx=adx_value,
+            plus_di=plus_di_value,
+            minus_di=minus_di_value,
+        )
+
+        # Calculate individual scores
+        components = {}  # Score contributions only
+        metadata = {}    # Raw values, flags, ratios
+        total_score = 0
+
+        # RSI component (graduated: returns -1.0 to +1.0)
+        rsi_signal = get_rsi_signal_graduated(indicators.rsi, self.rsi_oversold, self.rsi_overbought)
+        rsi_score = int(rsi_signal * self.weights.rsi)
+
+        # MACD component (graduated: returns -1.0 to +1.0, adaptive to candle interval)
+        # Use dynamic ATR-based scaling for better adaptability across assets and volatility regimes
+        # Enhanced validation: ensure ATR data is valid before using dynamic scaling
+        if atr_result is not None and len(atr_result.atr) > 0 and not atr_result.atr.empty:
+            macd_signal = get_macd_signal_graduated(
+                macd_result, price, self.candle_interval, atr_result, close, self.macd_interval_multipliers
+            )
+        else:
+            # Explicit fallback logging when ATR unavailable
+            logger.debug("atr_unavailable_using_static_macd_scale", candle_interval=self.candle_interval)
+            macd_signal = get_macd_signal_graduated(
+                macd_result, price, self.candle_interval, None, None, self.macd_interval_multipliers
+            )
+        macd_score = int(macd_signal * self.weights.macd)
+
+        # Bollinger Bands component (graduated: returns -1.0 to +1.0)
+        bb_signal = get_bollinger_signal_graduated(price, bollinger)
+        bb_score = int(bb_signal * self.weights.bollinger)
+
+        # EMA component (graduated: returns -1.0 to +1.0)
+        ema_signal = get_ema_signal_graduated(ema_result)
+        ema_score = int(ema_signal * self.weights.ema)
+
+        # Momentum mode: reduce overbought penalties during sustained uptrends
+        # Penalty reduction is proportional to trend strength (measured by EMA gap)
+        # to enable more responsive exits during genuine reversals
+        momentum_active, momentum_reason = self.is_momentum_mode(df, rsi)
+        if momentum_active:
+            original_rsi = rsi_score
+            original_bb = bb_score
+
+            # Calculate trend strength factor from EMA gap (0.0 to 1.0)
+            # Stronger trends (wider EMA gap) get more penalty reduction
+            # Weaker trends (narrower EMA gap) get less reduction for faster exits
+            # When EMAs are unavailable, trend_strength defaults to 0.0 (minimal reduction)
+            trend_strength = 0.0
+            ema_gap_percent = 0.0
+            # Minimum EMA value to filter out data quality issues (near-zero noise)
+            # Value of 1.0 covers any real tradeable asset while filtering bad data
+            MIN_EMA_VALUE = 1.0
+            # Explicit validation: momentum_trend_strength_cap should always be > 0
+            # Config validation enforces >= 1.0, but log warning if somehow invalid
+            if self.momentum_trend_strength_cap <= 0:
+                logger.warning(
+                    "invalid_momentum_trend_strength_cap",
+                    value=self.momentum_trend_strength_cap,
+                    action="skipping_trend_strength_calculation",
+                )
+            elif indicators.ema_fast and indicators.ema_slow and self.momentum_trend_strength_cap > 0:
+                # Convert to float for calculation
+                # Defense-in-depth: cap > 0 check in elif prevents division by zero even if
+                # config validation is bypassed or value changes at runtime
+                ema_slow_float = float(indicators.ema_slow)
+                ema_fast_float = float(indicators.ema_fast)
+                # Skip if EMAs are too small or invalid (EMAs for price data should always be positive)
+                # Using >= instead of abs() >= makes the assumption explicit and prevents edge cases
+                if ema_slow_float >= MIN_EMA_VALUE and ema_fast_float >= MIN_EMA_VALUE:
+                    ema_gap_percent = abs((ema_fast_float - ema_slow_float) / ema_slow_float) * 100
+                    # Cap at configured percentage for normalization
+                    # Linear scaling: 0% gap = 0.0 strength, cap% gap = 1.0 strength
+                    trend_strength = min(1.0, ema_gap_percent / self.momentum_trend_strength_cap)
+
+            # Scale the penalty reduction by trend strength
+            # Base reduction is configured value (default 0.5), scaled by trend strength
+            # Weak trend (0.0 strength): minimal reduction (near full penalty = more responsive)
+            # Strong trend (1.0 strength): full reduction (configured value)
+            # Formula: new_penalty = old_penalty * (1 - reduction)
+            # - reduction=0.0 → keep 100% of penalty (no change)
+            # - reduction=0.5 → keep 50% of penalty (half the overbought signal)
+            reduction = self.momentum_penalty_reduction * trend_strength
+
+            # Reduce overbought penalties by scaled factor (only negative scores)
+            # Use (1 - reduction) to keep the remaining portion of the penalty
+            # Example with default 0.5 max reduction:
+            # - Strong trend (1.0): reduction=0.5, keep 50% → -25 becomes -12
+            # - Moderate trend (0.5): reduction=0.25, keep 75% → -25 becomes -18
+            # - Weak trend (0.1): reduction=0.05, keep 95% → -25 becomes -23
+            # - No trend (0.0): reduction=0.0, keep 100% → -25 stays -25
+            #
+            # IMPORTANT: Only apply penalty reduction for buy signals (positive total_score).
+            # For sell signals, we want responsive exits at overbought levels, not reduced penalties.
+            # Calculate preliminary score to determine signal direction before adjustment.
+            preliminary_score = rsi_score + macd_score + bb_score + ema_score
+            # preliminary_score == 0 (neutral) gets no reduction, which is correct behavior
+            if preliminary_score > 0:  # Only for buy signals
+                if rsi_score < 0:
+                    rsi_score = int(rsi_score * (1 - reduction))
+                if bb_score < 0:
+                    bb_score = int(bb_score * (1 - reduction))
+            logger.info(
+                "momentum_mode_active",
+                reason=momentum_reason,
+                ema_gap_percent=round(ema_gap_percent, 3),
+                trend_strength=round(trend_strength, 3),
+                penalty_reduction=round(reduction, 3),
+                penalty_applied=preliminary_score > 0,
+                rsi_original=original_rsi,
+                rsi_adjusted=rsi_score,
+                bb_original=original_bb,
+                bb_adjusted=bb_score,
+            )
+        metadata["_momentum_active"] = 1 if momentum_active else 0
+
+        components["rsi"] = rsi_score
+        total_score += rsi_score
+        components["macd"] = macd_score
+        total_score += macd_score
+        components["bollinger"] = bb_score
+        total_score += bb_score
+        components["ema"] = ema_score
+        total_score += ema_score
+
+        # VWAP component (graduated: returns -1.0 to +1.0, mean-reversion signal)
+        # Only calculate if VWAP is available from enrichment data and weight > 0
+        # VWAP is a contrarian signal: price above VWAP = bearish, below = bullish
+        vwap_score = 0
+        if self.vwap_weight > 0 and indicators.vwap is not None:
+            vwap_signal = get_vwap_signal_graduated(
+                price, indicators.vwap, self.vwap_threshold_percent
+            )
+            vwap_score = int(vwap_signal * self.vwap_weight)
+            logger.debug(
+                "vwap_signal_calculated",
+                price=round(price, 2),
+                vwap=round(indicators.vwap, 2),
+                deviation_pct=round(indicators.price_vs_vwap_pct or 0, 3),
+                signal=round(vwap_signal, 3),
+                score=vwap_score,
+                weight=self.vwap_weight,
+            )
+        components["vwap"] = vwap_score
+        total_score += vwap_score
+
+        # Store raw indicator values for signal history
+        metadata["_rsi_value"] = indicators.rsi
+        metadata["_macd_histogram"] = indicators.macd_histogram
+        # Bollinger band position: 0 = at lower band, 1 = at upper band
+        if indicators.bb_upper and indicators.bb_lower and indicators.bb_upper != indicators.bb_lower:
+            metadata["_bb_position"] = (price - float(indicators.bb_lower)) / (float(indicators.bb_upper) - float(indicators.bb_lower))
+        else:
+            metadata["_bb_position"] = None
+        # EMA gap percent
+        if indicators.ema_fast and indicators.ema_slow and indicators.ema_slow != 0:
+            metadata["_ema_gap_percent"] = ((float(indicators.ema_fast) - float(indicators.ema_slow)) / float(indicators.ema_slow)) * 100
+        else:
+            metadata["_ema_gap_percent"] = None
+        # VWAP enrichment data
+        metadata["_vwap"] = indicators.vwap
+        metadata["_price_vs_vwap_pct"] = indicators.price_vs_vwap_pct
+        metadata["_trade_count"] = indicators.trade_count
+
+        # Volume confirmation (boost on high volume, penalty on low volume)
+        # Includes whale activity detection for extreme volume spikes
+        #
+        # NOTE: Whale direction (bullish/bearish) is informational only.
+        # The volume boost amplifies the existing signal direction from indicators,
+        # not the whale direction. This is intentional - whale activity increases
+        # conviction in whatever direction the indicators suggest, rather than
+        # overriding the technical analysis.
+        if volume is not None and len(volume) >= self.volume_sma_window:
+            volume_sma = volume.rolling(window=self.volume_sma_window).mean().iloc[-1]
+            current_volume = volume.iloc[-1]
+
+            if not pd.isna(volume_sma) and volume_sma > 0:
+                volume_ratio = round(current_volume / volume_sma, 2)
+
+                if volume_ratio > self.whale_volume_threshold:
+                    # WHALE ACTIVITY: Extreme volume spike (configurable threshold, default 3x)
+                    # Apply configurable boost (default 30%) - stronger signal than normal high volume
+                    #
+                    # Note: Volume boost is INDEPENDENT of OHLC consistency checks (below).
+                    # Volume ratio is calculated from volume data, not OHLC. Even if OHLC data
+                    # has timing inconsistencies (close outside high/low range), the volume
+                    # spike detection remains valid. Only the whale DIRECTION analysis (which
+                    # relies on close position within candle range) is affected by OHLC issues.
+                    #
+                    # On neutral signals (total_score=0), boost is 0 but _whale_activity
+                    # is still set True. This is intentional - whale activity on neutral signals
+                    # is valuable information for AI reviewers even without directional bias.
+                    volume_boost = int(abs(total_score) * self.whale_boost_percent)
+                    if total_score > 0:
+                        components["volume"] = volume_boost
+                        total_score += volume_boost
+                    elif total_score < 0:
+                        components["volume"] = -volume_boost
+                        total_score -= volume_boost
+                    else:
+                        components["volume"] = 0
+                    metadata["_whale_activity"] = 1
+                    metadata["_volume_ratio"] = volume_ratio
+
+                    # Determine whale direction based on price movement during volume spike
+                    # Enhanced with candle structure analysis for directional confirmation
+                    if len(close) >= 2:
+                        prev_price = close.iloc[-2]
+                        current_price = close.iloc[-1]
+                        if prev_price > 0 and not pd.isna(current_price) and current_price > 0:
+                            price_change_pct = (current_price - prev_price) / prev_price
+                            metadata["_price_change_pct"] = round(price_change_pct, 6)
+
+                            # Analyze candle structure to confirm direction
+                            # Check if candle closed near its high (bullish) or low (bearish)
+                            candle_high = high.iloc[-1]
+                            candle_low = low.iloc[-1]
+                            candle_range = candle_high - candle_low
+
+                            # Track if we should skip direction calculation due to data issues
+                            data_inconsistency = False
+
+                            # Calculate where the close is within the candle range (0 = low, 1 = high)
+                            if candle_range > 0 and not pd.isna(candle_high) and not pd.isna(candle_low):
+                                # Verify price is within expected range before calculation
+                                # Data inconsistency can occur when close/high/low come from slightly
+                                # different timestamps or feeds. This indicates data quality issues.
+                                # Use relative epsilon based on candle range (0.001% tolerance)
+                                # This scales with actual volatility, not absolute price level
+                                # Better handles assets at any price point (micro-cap to high-value)
+                                # candle_range > 0 guaranteed by if-condition on line 716
+                                epsilon = candle_range * self.PRICE_TOLERANCE_EPSILON
+                                if current_price < (candle_low - epsilon) or current_price > (candle_high + epsilon):
+                                    # Data inconsistency detected - log warning with context and treat as unknown
+                                    # Candle structure (close/high/low) is inconsistent, but price_change_pct
+                                    # (calculated from consecutive closes) remains valid and useful
+                                    price_diff = min(abs(current_price - candle_high), abs(candle_low - current_price))
+                                    logger.warning(
+                                        "price_outside_candle_range",
+                                        trading_pair=self.trading_pair,
+                                        current_price=float(current_price),
+                                        candle_low=float(candle_low),
+                                        candle_high=float(candle_high),
+                                        difference=float(price_diff),
+                                        action="treating_as_unknown",
+                                    )
+                                    close_position = None
+                                    metadata["_candle_close_position"] = None
+                                    metadata["_whale_direction"] = "unknown"
+                                    # Note: _price_change_pct is kept (already set on line 699) - it's still valid
+                                    data_inconsistency = True
+                                else:
+                                    # Division by zero protection: candle_range > 0 guaranteed by if-condition above (line 716)
+                                    close_position = (current_price - candle_low) / candle_range
+                                    # Store rounded value for display only; close_position variable remains unrounded for threshold comparisons below
+                                    metadata["_candle_close_position"] = round(close_position, 3)
+                            else:
+                                # Zero-range candle (doji/flat) or missing data:
+                                # When high == low (perfect equilibrium), candle_range = 0
+                                # This is interesting but ambiguous - treat as neutral
+                                # A zero-range candle with whale volume indicates perfect
+                                # equilibrium or a gap, which doesn't provide directional conviction
+                                close_position = None
+                                metadata["_candle_close_position"] = None
+
+                            # Determine direction with candle structure confirmation
+                            # Skip if data inconsistency was detected (price outside candle range)
+                            if not data_inconsistency:
+                                # Requires strong conviction: close_position STRICTLY > 0.7 (bullish) or STRICTLY < 0.3 (bearish)
+                                # The 0.3-0.7 range is intentionally treated as "ambiguous" requiring higher conviction:
+                                #   - Bullish: close_position > 0.7 (closed in top 30% of range)
+                                #   - Bearish: close_position < 0.3 (closed in bottom 30% of range)
+                                #   - At boundaries (exactly 0.3 or 0.7): treated as neutral (conservative)
+                                #   - Middle range (0.3 to 0.7): defaults to neutral
+                                # This prevents false signals from weak candle formations
+                                # Trade-off: Prioritizes precision over recall (fewer false positives, may miss some valid signals)
+                                # For a financial system, false negatives (missed opportunities) are safer than false positives (bad trades)
+                                if price_change_pct > self.whale_direction_threshold:
+                                    # Price moved up - check candle structure for confirmation
+                                    if close_position is not None and close_position > self.whale_candle_bullish_threshold:
+                                        metadata["_whale_direction"] = "bullish"
+                                    elif close_position is not None and close_position < 0.5:
+                                        # Closed in lower half despite price increase - fighting/rejection
+                                        metadata["_whale_direction"] = "neutral"
+                                    else:
+                                        # Conservative: treat as neutral if either:
+                                        # 1) Missing data (close_position is None)
+                                        # 2) Ambiguous range (0.5 <= close_position <= threshold)
+                                        # Both cases lack conviction for a directional signal
+                                        metadata["_whale_direction"] = "neutral"
+                                elif price_change_pct < -self.whale_direction_threshold:
+                                    # Price moved down - check candle structure for confirmation
+                                    if close_position is not None and close_position < self.whale_candle_bearish_threshold:
+                                        metadata["_whale_direction"] = "bearish"
+                                    elif close_position is not None and close_position > 0.5:
+                                        # Closed in upper half despite price decrease - fighting/support
+                                        metadata["_whale_direction"] = "neutral"
+                                    else:
+                                        # Conservative: treat as neutral if either:
+                                        # 1) Missing data (close_position is None)
+                                        # 2) Ambiguous range (bearish_threshold <= close_position <= 0.5)
+                                        # Both cases lack conviction for a directional signal
+                                        metadata["_whale_direction"] = "neutral"
+                                else:
+                                    metadata["_whale_direction"] = "neutral"
+                        else:
+                            # Zero/negative prev price - can't calculate direction
+                            metadata["_whale_direction"] = "unknown"
+                            metadata["_price_change_pct"] = None
+                            metadata["_candle_close_position"] = None
+                    else:
+                        metadata["_whale_direction"] = "unknown"
+                        metadata["_price_change_pct"] = None
+                        metadata["_candle_close_position"] = None
+                elif volume_ratio > self.high_volume_threshold:
+                    # High volume: boost signal by configurable percentage (default 20%)
+                    volume_boost = int(abs(total_score) * self.high_volume_boost_percent)
+                    if total_score > 0:
+                        components["volume"] = volume_boost
+                        total_score += volume_boost
+                    elif total_score < 0:
+                        components["volume"] = -volume_boost
+                        total_score -= volume_boost
+                    else:
+                        components["volume"] = 0
+                    metadata["_whale_activity"] = 0
+                    metadata["_volume_ratio"] = volume_ratio
+                elif volume_ratio < self.low_volume_threshold:
+                    # Low volume: fixed penalty (consistent behavior)
+                    if total_score > 0:
+                        components["volume"] = -self.low_volume_penalty
+                        total_score -= self.low_volume_penalty
+                    elif total_score < 0:
+                        components["volume"] = self.low_volume_penalty
+                        total_score += self.low_volume_penalty
+                    else:
+                        components["volume"] = 0
+                    metadata["_whale_activity"] = 0
+                    metadata["_volume_ratio"] = volume_ratio
+                else:
+                    components["volume"] = 0
+                    metadata["_whale_activity"] = 0
+                    metadata["_volume_ratio"] = volume_ratio
+            else:
+                # Invalid volume SMA (NaN or zero)
+                components["volume"] = 0
+                metadata["_whale_activity"] = 0
+                metadata["_volume_ratio"] = None
+        else:
+            # Insufficient volume data (< 20 candles)
+            components["volume"] = 0
+            metadata["_whale_activity"] = 0
+            metadata["_volume_ratio"] = None
+
+        # Log whale activity detection
+        if metadata.get("_whale_activity"):
+            logger.info(
+                "whale_activity_detected",
+                volume_ratio=metadata["_volume_ratio"],
+                volume_boost=components["volume"],
+                whale_direction=metadata.get("_whale_direction", "unknown"),
+                signal_direction="bullish" if total_score > 0 else "bearish" if total_score < 0 else "neutral",
+            )
+
+        # Store raw score before adjustments (for signal history)
+        metadata["_raw_score"] = total_score
+
+        # Trend filter: penalize counter-trend trades (scaled by signal strength)
+        # Skip penalty for extreme RSI (mean-reversion zones) with crash protection
+        trend = get_ema_trend(ema_result)
+        trend_adjustment = 0
+        rsi_extreme = indicators.rsi is not None and (indicators.rsi < self.extreme_rsi_lower or indicators.rsi > self.extreme_rsi_upper)
+
+        # Crash protection checks for mean-reversion trades
+        can_mean_revert = self.can_buy_oversold()
+        price_stable = self.is_price_stabilized(close)
+
+        if rsi_extreme and can_mean_revert and price_stable:
+            # Allow mean-reversion trade - all conditions met
+            logger.debug("trend_filter_skipped", reason="extreme_rsi_stable", rsi=indicators.rsi)
+        elif rsi_extreme and not can_mean_revert:
+            # Hit buy limit - apply trend filter anyway
+            logger.debug("trend_filter_applied", reason="oversold_buy_limit_reached", rsi=indicators.rsi)
+            if total_score > 0 and trend == "bearish":
+                signal_confidence = abs(total_score) / 100
+                trend_adjustment = -int(self.trend_filter_penalty * (1 - signal_confidence * 0.5))
+                total_score += trend_adjustment
+        elif rsi_extreme and not price_stable:
+            # Price still falling - apply trend filter
+            logger.debug("trend_filter_applied", reason="price_still_falling", rsi=indicators.rsi)
+            if total_score > 0 and trend == "bearish":
+                signal_confidence = abs(total_score) / 100
+                trend_adjustment = -int(self.trend_filter_penalty * (1 - signal_confidence * 0.5))
+                total_score += trend_adjustment
+        elif total_score > 0 and trend == "bearish":
+            # Scale penalty: stronger signals get less penalty
+            signal_confidence = abs(total_score) / 100
+            trend_adjustment = -int(self.trend_filter_penalty * (1 - signal_confidence * 0.5))
+            total_score += trend_adjustment
+        elif total_score < 0 and trend == "bullish":
+            # Scale penalty: stronger signals get less penalty
+            signal_confidence = abs(total_score) / 100
+            trend_adjustment = int(self.trend_filter_penalty * (1 - signal_confidence * 0.5))
+            total_score += trend_adjustment
+        components["trend_filter"] = trend_adjustment
+
+        # HTF (Higher Timeframe) bias modifier
+        # Purpose: Reduce false signals by aligning trades with the macro trend
+        # - Daily + 4-hour trends must agree for strong bias, otherwise neutral
+        # - Expected impact: 30-50% reduction in false signals
+        #
+        # Application logic (asymmetric for sell signals):
+        # - Bullish signal (+score): +boost if HTF bullish, -penalty if HTF bearish
+        # - Bearish signal (-score): -boost if HTF bearish (more negative = stronger sell),
+        #                            +penalty if HTF bullish (less negative = weaker sell)
+        htf_adjustment = 0
+        extreme_fear_override_applied = False  # Track if extreme fear override was used
+
+        if htf_bias and htf_bias != "neutral":
+            # Strong HTF bias (daily + 4H agree): apply full adjustment
+            if total_score > 0:  # Bullish signal (potential buy)
+                if htf_bias == "bullish":
+                    htf_adjustment = self.mtf_aligned_boost  # +20: stronger buy signal
+                elif htf_bias == "bearish":
+                    htf_adjustment = -self.mtf_counter_penalty  # -20: weaker buy signal
+            elif total_score < 0:  # Bearish signal (potential sell)
+                if htf_bias == "bearish":
+                    # Aligned: make more negative to strengthen sell signal
+                    htf_adjustment = -self.mtf_aligned_boost  # e.g., -60 → -80
+                elif htf_bias == "bullish":
+                    # Counter-trend: make less negative to weaken sell signal
+                    htf_adjustment = self.mtf_counter_penalty  # e.g., -60 → -40
+        elif htf_daily and htf_daily != "neutral":
+            # This branch only runs when MTF_4H_ENABLED=true AND daily/4H disagree.
+            # When 4H is disabled, htf_bias == htf_daily, so the first branch handles it.
+            #
+            # Here: htf_bias is "neutral" (daily + 4H disagree), but daily has direction.
+            # Apply half penalty when daily trend opposes signal - daily is more reliable.
+            # Use round() to handle odd mtf_counter_penalty values correctly.
+            half_penalty = round(self.mtf_counter_penalty / 2)
+
+            # ========== PROTECTION LAYER 3: Extreme Fear MTF Override ==========
+            # EXTREME FEAR OVERRIDE: Only applies when daily/4H disagree (htf_bias=neutral)
+            # When both timeframes agree, the existing aligned/counter logic already applies
+            # full penalties, so no override is needed.
+            #
+            # During extreme fear conditions, when daily/4H disagree, apply FULL counter-penalty
+            # based on daily trend (instead of the usual half penalty). This prevents 4H neutral
+            # signals from neutralizing the more reliable daily trend during extreme conditions.
+            #
+            # Applied BEFORE:
+            #   - Layer 4: Dual-extreme blocking (in runner.py:2059)
+            #   - Layer 5: Extreme volatility stop widening (in runner.py:3579)
+            #
+            # Applied AFTER:
+            #   - Base indicator scoring (RSI, MACD, Bollinger, EMA, Volume)
+            #   - Normal MTF alignment logic
+            #
+            # Rationale: Daily timeframe is more reliable during crashes. When 4H shows
+            # neutral but daily shows bearish during extreme fear, trust the daily signal.
+            if sentiment_category == "extreme_fear" and htf_daily == "bearish" and total_score > 0:
+                # Buying into bearish daily trend during extreme fear - apply FULL penalty
+                htf_adjustment = -self.mtf_counter_penalty
+                extreme_fear_override_applied = True
+                score_before = total_score
+                total_score += htf_adjustment
+                logger.info(
+                    "extreme_fear_daily_penalty_applied",
+                    htf_daily=htf_daily,
+                    htf_4h=htf_4h,
+                    sentiment=sentiment_category,
+                    signal_direction="buy",
+                    adjustment=htf_adjustment,
+                    score_before=score_before,
+                    score_after=total_score,
+                )
+            elif sentiment_category == "extreme_fear" and htf_daily == "bullish" and total_score < 0:
+                # Selling into bullish daily trend during extreme fear - apply FULL penalty
+                # to weaken sell signal more aggressively (prevent panic selling)
+                htf_adjustment = self.mtf_counter_penalty
+                extreme_fear_override_applied = True
+                score_before = total_score
+                total_score += htf_adjustment
+                logger.info(
+                    "extreme_fear_daily_penalty_applied",
+                    htf_daily=htf_daily,
+                    htf_4h=htf_4h,
+                    sentiment=sentiment_category,
+                    signal_direction="sell",
+                    adjustment=htf_adjustment,
+                    score_before=score_before,
+                    score_after=total_score,
+                )
+            elif total_score > 0 and htf_daily == "bearish":
+                # Buying into bearish daily trend - apply half penalty
+                htf_adjustment = -half_penalty
+            elif total_score < 0 and htf_daily == "bullish":
+                # Selling into bullish daily trend - weaken sell signal
+                htf_adjustment = half_penalty
+
+        # Apply adjustment and log only if NOT already handled by extreme fear override
+        if htf_adjustment != 0 and not extreme_fear_override_applied:
+            score_before = total_score
+            total_score += htf_adjustment
+            logger.info(
+                "htf_bias_applied",
+                htf_bias=htf_bias if htf_bias is not None else "unknown",
+                htf_daily=htf_daily if htf_daily is not None else "unknown",
+                htf_4h=htf_4h if htf_4h is not None else "unknown",
+                sentiment=sentiment_category,
+                signal_direction="bullish" if score_before > 0 else "bearish",
+                score_before=score_before,
+                score_after=total_score,
+                adjustment=htf_adjustment,
+                partial_penalty=htf_bias == "neutral" or htf_bias is None,
+            )
+
+        components["htf_bias"] = htf_adjustment
+        # Use explicit None checks for null safety (avoid masking empty strings).
+        # HTF values are expected to be: "bullish", "bearish", "neutral", or None.
+        # Empty strings should NOT occur in production (would indicate a bug in get_trend()).
+        # If empty strings appear, they are preserved for debugging (not masked as "unknown").
+        # None values indicate missing/unavailable data and are replaced with "unknown".
+        # See also: src/ai/trade_reviewer.py for similar pattern
+        metadata["_htf_trend"] = htf_bias if htf_bias is not None else "unknown"
+        metadata["_htf_daily"] = htf_daily if htf_daily is not None else "unknown"
+        metadata["_htf_4h"] = htf_4h if htf_4h is not None else "unknown"
+
+        # Apply ADX trend strength confidence multiplier
+        # Reduces signal strength during choppy/ranging markets where momentum signals are unreliable
+        adx_multiplier = 1.0
+        if self.adx_enabled and adx_value is not None:
+            adx_multiplier = get_adx_confidence_multiplier(
+                adx_value,
+                weak_threshold=self.adx_weak_threshold,
+                strong_threshold=self.adx_strong_threshold,
+            )
+            if adx_multiplier != 1.0:
+                score_before_adx = total_score
+                total_score = int(total_score * adx_multiplier)
+                logger.info(
+                    "adx_confidence_applied",
+                    adx=round(adx_value, 2),
+                    trend_strength=classify_trend_strength(adx_value),
+                    multiplier=adx_multiplier,
+                    score_before=score_before_adx,
+                    score_after=total_score,
+                )
+        metadata["_adx"] = round(adx_value, 2) if adx_value is not None else None
+        metadata["_adx_multiplier"] = adx_multiplier
+        metadata["_adx_trend_strength"] = classify_trend_strength(adx_value)
+
+        # Clamp score to -100 to +100
+        total_score = max(-100, min(100, total_score))
+
+        # Determine action
+        if total_score >= self.threshold:
+            action = "buy"
+        elif total_score <= -self.threshold:
+            action = "sell"
+        else:
+            action = "hold"
+
+        # Calculate confidence with confluence factor
+        # Combines magnitude with how many indicators agree
+        if action != "hold":
+            # Components dict should never be empty for non-hold actions
+            if not components:
+                raise ValueError(
+                    "Components dict is empty for non-hold action - this indicates a bug in signal calculation"
+                )
+
+            # Count agreeing indicators (non-zero contributions)
+            confluence_count = sum(
+                1 for score in components.values()
+                if score != 0
+            )
+            # Use actual component count for robustness (typically 7: rsi, macd, bollinger, ema, volume, trend_filter, htf_bias)
+            confluence_factor = confluence_count / len(components)
+
+            # Combine magnitude and confluence (equally weighted)
+            magnitude_confidence = abs(total_score) / 100
+            confidence = (magnitude_confidence + confluence_factor) / 2
+            confidence = min(1.0, confidence)
+        else:
+            confidence = 0.0
+
+        result = SignalResult(
+            score=total_score,
+            action=action,
+            indicators=indicators,
+            components=components,
+            metadata=metadata,
+            confidence=confidence,
+        )
+
+        logger.debug(
+            "signal_calculated",
+            score=total_score,
+            action=action,
+            components=components,
+            metadata=metadata,
+            confidence=confidence,
+        )
+
+        return result
+
+    def get_trend(self, df: pd.DataFrame) -> str:
+        """
+        Get current market trend.
+
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            "bullish", "bearish", or "neutral"
+        """
+        if df.empty or len(df) < self.ema_slow_period:
+            return "neutral"
+
+        close = df["close"].astype(float)
+        ema_result = calculate_ema_crossover(close, self.ema_fast, self.ema_slow_period)
+
+        return get_ema_trend(ema_result)
