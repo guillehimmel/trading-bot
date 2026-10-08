@@ -196,7 +196,14 @@ class Backtester:
                         capital += trade.pnl - trade.fees
                         position = None
 
-            equity.append(capital)
+            # Equity a valor de mercado: el capital realizado + la ganancia/pérdida
+            # no realizada de la posición abierta. Sin esto el drawdown ignora las
+            # caídas dentro de un trade (solo veía el capital cuando el trade cerraba).
+            if position is not None:
+                unreal = (close - position.entry_price) * position.quantity
+                equity.append(capital + unreal)
+            else:
+                equity.append(capital)
 
         # Close any leftover open position at last price
         if position is not None:

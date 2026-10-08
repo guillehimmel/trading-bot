@@ -37,16 +37,22 @@ def main() -> None:
     ap.add_argument("--csv", help="CSV propio en vez de bajar de Binance")
     ap.add_argument("--interval", help="intervalo del CSV (1h/4h/1d); solo corre las estrategias de ese intervalo")
     ap.add_argument("--only", help="nombre de una estrategia")
+    ap.add_argument("--no-correction", action="store_true",
+                    help="NO corregir el umbral del monkey test por la cantidad de estrategias (menos exigente)")
     args = ap.parse_args()
 
     cache: Dict[str, pd.DataFrame] = {}
     approved = []
+    selected = [cls for cls in ALL_STRATEGIES
+                if not (args.only and cls().name != args.only)
+                and not (args.csv and args.interval and cls().candle_interval != args.interval)]
+    n_tests = 1 if args.no_correction else len(selected)
+    print(f"Probando {len(selected)} estrategia(s); umbral de p-value corregido por múltiples "
+          f"pruebas: {'no' if args.no_correction else 'sí (Šidák)'}\n")
     print(f"{'estrategia':22s} {'int':3s} {'trIS':>5s} {'PFis':>5s} {'trOOS':>5s} {'PFoos':>5s} "
-          f"{'DDoos':>6s} {'p-azar':>6s} {'vecinos':>7s}  veredicto")
-    for cls in ALL_STRATEGIES:
+          f"{'DDoos':>6s} {'Sharpe':>6s} {'p-azar':>6s} {'vec':>4s} {'MC-dd95':>7s} {'WF':>5s}  veredicto")
+    for cls in selected:
         probe = cls()
-        if args.only and probe.name != args.only:
-            continue
         iv = probe.candle_interval
         if args.csv:
             if args.interval and iv != args.interval:
@@ -58,16 +64,18 @@ def main() -> None:
             cache[iv] = add_all_indicators(get_klines_since(args.symbol, iv, args.days))
         try:
             ev = evaluate_strategy(cls, cache[iv], optimize_trials=args.optimize,
-                                   cfg={"n_monkeys": args.monkeys})
+                                   cfg={"n_monkeys": args.monkeys}, n_tests=n_tests)
         except ValueError as e:
             print(f"{probe.name:22s} {iv:3s}  omitida: {e}")
             continue
         p = f"{ev.monkey.p_value:.2f}" if ev.monkey else "  - "
         nb = f"{ev.neighbors.fraction_profitable:.0%}" if ev.neighbors else " - "
+        mc = f"{ev.monte_carlo.dd_p95:.0%}" if ev.monte_carlo else "  - "
+        wf = f"{ev.walk_forward.profitable}/{ev.walk_forward.windows_with_trades}" if ev.walk_forward else " - "
         verdict = "APROBADA" if ev.approved else "descartada: " + "; ".join(ev.reasons)
         print(f"{ev.name:22s} {iv:3s} {ev.res_is.total_trades:5d} {ev.res_is.profit_factor:5.2f} "
               f"{ev.res_oos.total_trades:5d} {ev.res_oos.profit_factor:5.2f} "
-              f"{ev.res_oos.max_drawdown:6.1%} {p:>6s} {nb:>7s}  {verdict}")
+              f"{ev.res_oos.max_drawdown:6.1%} {ev.risk_oos.sharpe:6.2f} {p:>6s} {nb:>4s} {mc:>7s} {wf:>5s}  {verdict}")
         if ev.approved:
             approved.append(ev)
             if ev.params:

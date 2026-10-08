@@ -162,3 +162,77 @@ def test_constructing_with_overrides_never_mutates_shared_defaults(cls):
     cls(numeric)                                   # instancia con valores distintos
     assert cls().params == snapshot                # los defaults siguen intactos
     assert cfg.STRATEGY_PARAMS[base.name] == snapshot
+
+
+# ── Monte Carlo sobre trades ─────────────────────────────────────────────────
+
+def _mc_result(pnls, start=1000.0):
+    r = _result(trades=len(pnls), pnl_pcts=[0.01] * len(pnls))
+    for t, p in zip(r.trades, pnls):
+        t.pnl, t.fees = p, 0.0
+    r.equity_curve = [start]
+    return r
+
+
+def test_monte_carlo_passes_a_clearly_profitable_edge():
+    mc = v.monte_carlo_trades(_mc_result([20.0] * 30 + [-5.0] * 10), n_sims=500, seed=1)
+    assert mc.passed and mc.prob_loss == 0.0 and mc.ret_p5 > 0
+
+
+def test_monte_carlo_fails_a_losing_strategy_and_a_deep_drawdown():
+    losing = v.monte_carlo_trades(_mc_result([10.0] * 10 + [-30.0] * 10), n_sims=500, seed=1)
+    assert not losing.passed and losing.prob_loss > 0.5
+    # ganadora en promedio pero con pérdidas enormes: el orden adverso da un drawdown grande
+    risky = v.monte_carlo_trades(_mc_result([100.0] * 12 + [-250.0] * 4), n_sims=500, seed=1)
+    assert risky.dd_p95 > 0.3 and not risky.passed
+
+
+def test_monte_carlo_needs_enough_trades_and_is_reproducible():
+    assert v.monte_carlo_trades(_mc_result([1.0] * 5)) is None
+    a = v.monte_carlo_trades(_mc_result([5.0, -4.0] * 10), n_sims=300, seed=9)
+    b = v.monte_carlo_trades(_mc_result([5.0, -4.0] * 10), n_sims=300, seed=9)
+    assert (a.prob_loss, a.dd_p95) == (b.prob_loss, b.dd_p95)
+
+
+# ── Walk-forward ─────────────────────────────────────────────────────────────
+
+def test_walk_forward_returns_per_window_stats():
+    wf = v.walk_forward(DonchianBreakoutStrategy, _df(2500, drift=0.002, seed=3), n_windows=4)
+    assert wf is not None and wf.n_windows == 4
+    assert 0 <= wf.profitable <= wf.windows_with_trades <= 4
+    assert len(wf.pfs) == wf.windows_with_trades
+    assert wf.passed == (wf.windows_with_trades >= 3 and wf.profitable / wf.windows_with_trades >= 0.6)
+
+
+def test_walk_forward_none_when_chunks_are_shorter_than_warmup():
+    from src.lab.strategies.supertrend import SuperTrendStrategy       # min_candles = 120
+    assert SuperTrendStrategy().min_candles > 300 // 5
+    assert v.walk_forward(SuperTrendStrategy, _df(300), n_windows=4) is None
+
+
+def test_walk_forward_oos_windows_do_not_overlap_in_trading():
+    """Cada ventana OOS arranca justo donde terminó la anterior (sin operar dos veces el mismo tramo)."""
+    df = _df(2500)
+    chunk = len(df) // 5
+    probe = DonchianBreakoutStrategy()
+    starts = [k * chunk for k in range(1, 5)]
+    firsts = [df.iloc[k * chunk - probe.min_candles: (k + 1) * chunk].index[probe.min_candles]
+              for k in range(1, 5)]
+    assert firsts == [df.index[s] for s in starts]
+
+
+# ── Corrección por múltiples pruebas ─────────────────────────────────────────
+
+def test_sidak_threshold_gets_stricter_with_more_tests():
+    assert v.sidak_threshold(0.15, 1) == pytest.approx(0.15)
+    assert v.sidak_threshold(0.15, 14) < v.sidak_threshold(0.15, 4) < 0.15
+    assert v.sidak_threshold(0.15, 14) == pytest.approx(1 - 0.85 ** (1 / 14))
+    assert v.sidak_threshold(0.15, 0) == pytest.approx(0.15)       # n inválido no rompe
+
+
+def test_evaluate_reports_all_layers_and_applies_correction():
+    ev = v.evaluate_strategy(DonchianBreakoutStrategy, _df(2500, drift=0.001, seed=2),
+                             cfg={"n_monkeys": 100, "mc_simulations": 100}, n_tests=14)
+    assert ev.p_value_threshold == pytest.approx(v.sidak_threshold(0.15, 14))
+    assert ev.walk_forward is not None and ev.risk_oos is not None
+    assert ev.approved == (not ev.reasons)
