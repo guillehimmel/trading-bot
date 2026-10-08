@@ -19,3 +19,6 @@ aioresponses>=0.7.0
 pytest-timeout>=2.1.0
 pytest-xdist>=3.3.0
 faker>=19.0.0
+
+# Optimización de parámetros (src/lab/validation.py)
+optuna>=3.0

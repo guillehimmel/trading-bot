@@ -146,3 +146,20 @@ STRATEGY_PARAMS.update({
         "candle_interval": "4h",
     },
 })
+
+
+# STRATEGY_PARAMS entrega siempre una copia: las estrategias hacen `defaults.update(params)`
+# y, sin esto, cada instancia con valores distintos (optimización, chequeo de vecinos)
+# modificaba los parámetros por defecto de todas las instancias siguientes.
+import copy as _copy
+
+
+class _CopyOnReadDict(dict):
+    def __getitem__(self, key):
+        return _copy.deepcopy(super().__getitem__(key))
+
+    def get(self, key, default=None):
+        return _copy.deepcopy(super().get(key, default))
+
+
+STRATEGY_PARAMS = _CopyOnReadDict(STRATEGY_PARAMS)

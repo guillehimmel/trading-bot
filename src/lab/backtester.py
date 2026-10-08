@@ -51,6 +51,7 @@ class BacktestTrade:
     exit_time: datetime
     duration_hours: float
     exit_reason: str
+    hold_candles: int = 0               # duración real en velas
 
 
 @dataclass
@@ -94,7 +95,12 @@ class Backtester:
     """
 
     def __init__(self, strategy: BaseStrategy, df: pd.DataFrame,
-                 initial_capital: float = None):
+                 initial_capital: float = None, next_bar: bool = True):
+        # next_bar=True: la señal se genera con la vela i cerrada y la orden se
+        # ejecuta en la APERTURA de la vela i+1 (lo que pasaría en vivo).
+        # next_bar=False reproduce el comportamiento original (entrada al cierre
+        # de la vela de la señal), que es más optimista.
+        self.next_bar = next_bar
         self.strategy = strategy
         self.df = df.copy().reset_index(drop=True)
         self.initial_capital = initial_capital or (
@@ -108,6 +114,7 @@ class Backtester:
         equity  = [capital]
         trades: List[BacktestTrade] = []
         position: Optional[BacktestPosition] = None
+        pending: Optional[Signal] = None
 
         fee_rt = config.TRADING_FEE + config.SLIPPAGE   # round-trip half
         min_c  = strat.min_candles
@@ -129,45 +136,38 @@ class Backtester:
                     trade = self._close_position(
                         position, exit_price, ts, exit_reason, fee_rt
                     )
+                    trade.hold_candles = i - position.entry_idx
                     trades.append(trade)
                     capital += trade.pnl - trade.fees
                     position = None
                     equity.append(capital)
                     continue
 
+            # ── Orden pendiente de la vela anterior: se ejecuta en esta apertura ──
+            # (el chequeo de salida de arriba corre antes de abrir; la posición
+            # recién abierta se evalúa recién en la vela siguiente)
             # ── Look for new entry (no pyramiding) ────────────────────────────
             if position is None:
-                window = df.iloc[max(0, i - strat.min_candles): i + 1]
-                signal: Signal = strat.generate_signal(window)
+                if pending is not None:
+                    position = self._open_position(
+                        pending, float(row["open"]), i, ts, capital, fee_rt, max_pos_pct,
+                        strat.max_hold_candles)
+                    pending = None
+                else:
+                    window = df.iloc[max(0, i - strat.min_candles): i + 1]
+                    signal: Signal = strat.generate_signal(window)
 
-                if signal.type == SignalType.SELL and not config.ALLOW_SHORT:
-                    # Binance spot no permite shorts: un SELL sin posición abierta se ignora
-                    signal = Signal(SignalType.HOLD, 0.0)
+                    if signal.type == SignalType.SELL and not config.ALLOW_SHORT:
+                        # Binance spot no permite shorts: un SELL sin posición abierta se ignora
+                        signal = Signal(SignalType.HOLD, 0.0)
 
-                if signal.is_actionable and signal.confidence >= 0.45:
-                    qty_capital = capital * max_pos_pct * signal.confidence
-                    qty_capital = min(qty_capital, capital * 0.60)   # hard cap
-                    quantity    = qty_capital / close
-                    if quantity * close < 10:   # min $10 order
-                        continue
-
-                    sl = signal.stop_loss  or close * (1 - config.DEFAULT_STOP_LOSS_PCT)
-                    tp = signal.take_profit or close * (1 + config.DEFAULT_TAKE_PROFIT_PCT)
-                    if signal.type == SignalType.SELL:
-                        sl = signal.stop_loss  or close * (1 + config.DEFAULT_STOP_LOSS_PCT)
-                        tp = signal.take_profit or close * (1 - config.DEFAULT_TAKE_PROFIT_PCT)
-
-                    position = BacktestPosition(
-                        side="LONG" if signal.type == SignalType.BUY else "SHORT",
-                        entry_price=close * (1 + fee_rt),   # include entry slippage
-                        quantity=quantity,
-                        stop_loss=sl,
-                        take_profit=tp,
-                        entry_idx=i,
-                        entry_time=ts,
-                        confidence=signal.confidence,
-                        max_hold=strat.max_hold_candles,
-                    )
+                    if signal.is_actionable and signal.confidence >= 0.45:
+                        if self.next_bar:
+                            pending = signal
+                        else:
+                            position = self._open_position(
+                                signal, close, i, ts, capital, fee_rt, max_pos_pct,
+                                strat.max_hold_candles)
 
             equity.append(capital)
 
@@ -176,11 +176,43 @@ class Backtester:
             last_close = float(df.iloc[-1]["close"])
             last_ts    = df.index[-1] if hasattr(df.index[-1], "isoformat") else datetime.utcnow()
             trade = self._close_position(position, last_close, last_ts, "END_OF_DATA", fee_rt)
+            trade.hold_candles = len(df) - 1 - position.entry_idx
             trades.append(trade)
             capital += trade.pnl - trade.fees
 
         equity.append(capital)
         return self._compute_metrics(trades, equity, len(df))
+
+    # ─── Entry logic ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _open_position(signal: Signal, price: float, i: int, ts, capital: float,
+                       fee_rt: float, max_pos_pct: float, max_hold: int
+                       ) -> Optional[BacktestPosition]:
+        """Abre una posición al precio dado (cierre o apertura, según next_bar)."""
+        qty_capital = capital * max_pos_pct * signal.confidence
+        qty_capital = min(qty_capital, capital * 0.60)   # hard cap
+        quantity    = qty_capital / price
+        if quantity * price < 10:   # min $10 order
+            return None
+
+        sl = signal.stop_loss  or price * (1 - config.DEFAULT_STOP_LOSS_PCT)
+        tp = signal.take_profit or price * (1 + config.DEFAULT_TAKE_PROFIT_PCT)
+        if signal.type == SignalType.SELL:
+            sl = signal.stop_loss  or price * (1 + config.DEFAULT_STOP_LOSS_PCT)
+            tp = signal.take_profit or price * (1 - config.DEFAULT_TAKE_PROFIT_PCT)
+
+        return BacktestPosition(
+            side="LONG" if signal.type == SignalType.BUY else "SHORT",
+            entry_price=price * (1 + fee_rt),   # include entry slippage
+            quantity=quantity,
+            stop_loss=sl,
+            take_profit=tp,
+            entry_idx=i,
+            entry_time=ts,
+            confidence=signal.confidence,
+            max_hold=max_hold,
+        )
 
     # ─── Exit logic ───────────────────────────────────────────────────────────
 
