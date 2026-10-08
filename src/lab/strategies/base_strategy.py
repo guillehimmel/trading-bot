@@ -73,6 +73,15 @@ class BaseStrategy(ABC):
         """
         return 48
 
+    def exit_signal(self, df: pd.DataFrame) -> bool:
+        """
+        ¿Hay que cerrar la posición long abierta? Se evalúa con cada vela cerrada.
+        Por defecto nunca: la posición sale solo por stop, take-profit o tiempo
+        máximo. Las estrategias de tendencia lo sobreescriben (p. ej. cuando la
+        tendencia se da vuelta).
+        """
+        return False
+
     # ─── Convenience helpers ──────────────────────────────────────────────────
 
     def update_params(self, new_params: Dict[str, Any]):

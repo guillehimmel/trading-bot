@@ -163,3 +163,11 @@ class _CopyOnReadDict(dict):
 
 
 STRATEGY_PARAMS = _CopyOnReadDict(STRATEGY_PARAMS)
+
+# Estrategias basadas en el curso AxelMunguiaQuintero/Trading-Cuantitativo-en-Python (MIT).
+# Longitud 10 / factor 3 son los valores clásicos de SuperTrend; step 0.02 / max 0.20 los de
+# Wilder para el SAR. atr_tp_mult es un tope lejano: la salida normal es la señal de la estrategia.
+STRATEGY_PARAMS.update({
+    "SuperTrend": {"length": 10, "factor": 3.0, "atr_tp_mult": 8.0, "candle_interval": "4h"},
+    "Parabolic_SAR": {"step": 0.02, "max_step": 0.20, "atr_tp_mult": 8.0, "candle_interval": "4h"},
+})

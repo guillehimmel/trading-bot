@@ -87,6 +87,68 @@ def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return (direction * volume).cumsum()
 
 
+# ─── SuperTrend / Parabolic SAR ───────────────────────────────────────────────
+# Reescritos a partir de los scripts del curso AxelMunguiaQuintero/Trading-Cuantitativo-
+# en-Python (MIT), con ATR de Wilder, sin recorrer pandas por índice y devolviendo
+# arrays alineados con el DataFrame original.
+
+def supertrend(high: pd.Series, low: pd.Series, close: pd.Series,
+               length: int = 10, factor: float = 3.0):
+    """Devuelve (linea, direccion): direccion +1 alcista (línea bajo el precio) / -1 bajista.
+    Causal: el valor en la vela i solo usa velas <= i."""
+    h, l, c = (x.to_numpy(dtype=float) for x in (high, low, close))
+    n = len(c)
+    atr = _atr(high, low, close, length).to_numpy(dtype=float)
+    hl2 = (h + l) / 2.0
+    basic_u, basic_l = hl2 + factor * atr, hl2 - factor * atr
+
+    fu, fl = basic_u.copy(), basic_l.copy()
+    direction = np.ones(n, dtype=int)
+    line = np.full(n, np.nan)
+    for i in range(1, n):
+        if np.isnan(atr[i]) or np.isnan(fu[i - 1]):
+            continue
+        fu[i] = basic_u[i] if (basic_u[i] < fu[i - 1] or c[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = basic_l[i] if (basic_l[i] > fl[i - 1] or c[i - 1] < fl[i - 1]) else fl[i - 1]
+        if direction[i - 1] == 1:
+            direction[i] = -1 if c[i] < fl[i] else 1
+        else:
+            direction[i] = 1 if c[i] > fu[i] else -1
+        line[i] = fl[i] if direction[i] == 1 else fu[i]
+    return (pd.Series(line, index=close.index, name="supertrend"),
+            pd.Series(direction, index=close.index, name="supertrend_dir"))
+
+
+def parabolic_sar(high: pd.Series, low: pd.Series, step: float = 0.02,
+                  max_step: float = 0.20):
+    """Devuelve (sar, tendencia_alcista[bool]). SAR de Wilder; causal."""
+    h, l = high.to_numpy(dtype=float), low.to_numpy(dtype=float)
+    n = len(h)
+    sar = np.full(n, np.nan)
+    up_trend = np.ones(n, dtype=bool)
+    if n < 3:
+        return (pd.Series(sar, index=high.index), pd.Series(up_trend, index=high.index))
+    up, af, ep = True, step, h[0]
+    sar[0] = l[0]
+    for i in range(1, n):
+        s = sar[i - 1] + af * (ep - sar[i - 1])
+        if up:
+            s = min(s, l[i - 1], l[i - 2] if i >= 2 else l[i - 1])
+            if l[i] < s:                       # se da vuelta a bajista
+                up, s, ep, af = False, ep, l[i], step
+            elif h[i] > ep:
+                ep, af = h[i], min(af + step, max_step)
+        else:
+            s = max(s, h[i - 1], h[i - 2] if i >= 2 else h[i - 1])
+            if h[i] > s:                       # se da vuelta a alcista
+                up, s, ep, af = True, ep, h[i], step
+            elif l[i] < ep:
+                ep, af = l[i], min(af + step, max_step)
+        sar[i], up_trend[i] = s, up
+    return (pd.Series(sar, index=high.index, name="psar"),
+            pd.Series(up_trend, index=high.index, name="psar_up"))
+
+
 # ─── Main function ────────────────────────────────────────────────────────────
 
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:

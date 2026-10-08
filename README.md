@@ -10,6 +10,7 @@ Se arma combinando lo mejor de tres proyectos:
 | [benclawbot/Claude-trading-bot](https://github.com/benclawbot/Claude-trading-bot) | sin licencia | Estrategias, backtester, cliente Binance |
 | [hugoguerrap/crypto-claude-desk](https://github.com/hugoguerrap/crypto-claude-desk) | MIT | Fuentes de datos (futuros, DeFiLlama, microestructura) |
 | [lauragp28/generador-trading-claude-code](https://github.com/lauragp28/generador-trading-claude-code) | sin licencia | Metodología de validación (IS/OOS, monkey test, vecinos) |
+| [AxelMunguiaQuintero/Trading-Cuantitativo-en-Python](https://github.com/AxelMunguiaQuintero/Trading-Cuantitativo-en-Python) | MIT | Indicadores y estrategias SuperTrend y Parabolic SAR (reescritos) |
 | [jmoraleses/Backtrader-optuna](https://github.com/jmoraleses/Backtrader-optuna) | sin licencia | Solo la idea de optimizar con Optuna (sin código) |
 
 Repo privado: no publicar, por la AGPL y por el código sin licencia.
@@ -18,7 +19,7 @@ Repo privado: no publicar, por la AGPL y por el código sin licencia.
 
 - **Base** (`src/`, `config/`): exchanges, puntaje de señales, seguridad, paper trading, dashboard, Telegram.
 - **Binance Spot** (`src/api/binance_client.py`): testnet por defecto (`BINANCE_TESTNET=true`). Par: `TRADING_PAIR=BTC-USDT`.
-- **Laboratorio de estrategias** (`src/lab/`): 12 estrategias, backtester **solo-long** con ejecución en la **apertura de la vela siguiente** y cargador de velas públicas de Binance.
+- **Laboratorio de estrategias** (`src/lab/`): 14 estrategias, backtester **solo-long** con ejecución en la **apertura de la vela siguiente** y cargador de velas públicas de Binance.
 - **Validación anti-sobreajuste** (`src/lab/validation.py`): split IS/OOS, monkey test, chequeo de vecinos y optimización con Optuna solo sobre IS.
 
 ```bash

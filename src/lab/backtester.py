@@ -115,6 +115,7 @@ class Backtester:
         trades: List[BacktestTrade] = []
         position: Optional[BacktestPosition] = None
         pending: Optional[Signal] = None
+        pending_exit = False
 
         fee_rt = config.TRADING_FEE + config.SLIPPAGE   # round-trip half
         min_c  = strat.min_candles
@@ -126,6 +127,27 @@ class Backtester:
             high  = float(row["high"])
             low   = float(row["low"])
             ts    = row.name if hasattr(row.name, "isoformat") else datetime.utcnow()
+
+            # ── Orden pendiente de la vela anterior: se abre en ESTA apertura y esta
+            #    misma vela ya puede tocar su stop o take-profit (más conservador) ──
+            if position is None and pending is not None:
+                position = self._open_position(
+                    pending, float(row["open"]), i, ts, capital, fee_rt, max_pos_pct,
+                    strat.max_hold_candles)
+                pending = None
+
+            # ── Salida por señal de la estrategia (decidida en la vela anterior) ──
+            if position is not None and pending_exit:
+                trade = self._close_position(
+                    position, float(row["open"]), ts, "SIGNAL_EXIT", fee_rt)
+                trade.hold_candles = i - position.entry_idx
+                trades.append(trade)
+                capital += trade.pnl - trade.fees
+                position = None
+                pending_exit = False
+                equity.append(capital)
+                continue
+            pending_exit = False
 
             # ── Manage open position ──────────────────────────────────────────
             if position is not None:
@@ -143,31 +165,36 @@ class Backtester:
                     equity.append(capital)
                     continue
 
-            # ── Orden pendiente de la vela anterior: se ejecuta en esta apertura ──
-            # (el chequeo de salida de arriba corre antes de abrir; la posición
-            # recién abierta se evalúa recién en la vela siguiente)
             # ── Look for new entry (no pyramiding) ────────────────────────────
             if position is None:
-                if pending is not None:
-                    position = self._open_position(
-                        pending, float(row["open"]), i, ts, capital, fee_rt, max_pos_pct,
-                        strat.max_hold_candles)
-                    pending = None
-                else:
-                    window = df.iloc[max(0, i - strat.min_candles): i + 1]
-                    signal: Signal = strat.generate_signal(window)
+                window = df.iloc[max(0, i - strat.min_candles): i + 1]
+                signal: Signal = strat.generate_signal(window)
 
-                    if signal.type == SignalType.SELL and not config.ALLOW_SHORT:
-                        # Binance spot no permite shorts: un SELL sin posición abierta se ignora
-                        signal = Signal(SignalType.HOLD, 0.0)
+                if signal.type == SignalType.SELL and not config.ALLOW_SHORT:
+                    # Binance spot no permite shorts: un SELL sin posición abierta se ignora
+                    signal = Signal(SignalType.HOLD, 0.0)
 
-                    if signal.is_actionable and signal.confidence >= 0.45:
-                        if self.next_bar:
-                            pending = signal
-                        else:
-                            position = self._open_position(
-                                signal, close, i, ts, capital, fee_rt, max_pos_pct,
-                                strat.max_hold_candles)
+                if signal.is_actionable and signal.confidence >= 0.45:
+                    if self.next_bar:
+                        pending = signal
+                    else:
+                        position = self._open_position(
+                            signal, close, i, ts, capital, fee_rt, max_pos_pct,
+                            strat.max_hold_candles)
+
+            # ── ¿La estrategia pide salir? (se evalúa con la vela i ya cerrada) ──
+            if position is not None and (position.entry_idx < i or self.next_bar):
+                window = df.iloc[max(0, i - strat.min_candles): i + 1]
+                if strat.exit_signal(window):
+                    if self.next_bar:
+                        pending_exit = True       # se ejecuta en la apertura de i+1
+                    else:
+                        trade = self._close_position(
+                            position, close, ts, "SIGNAL_EXIT", fee_rt)
+                        trade.hold_candles = i - position.entry_idx
+                        trades.append(trade)
+                        capital += trade.pnl - trade.fees
+                        position = None
 
             equity.append(capital)
 

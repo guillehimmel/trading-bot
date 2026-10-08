@@ -11,6 +11,8 @@ from .rsi_bollinger import RSIBollingerStrategy
 from .macd_momentum import MACDMomentumStrategy
 from .ema_crossover import EMACrossoverStrategy
 from .breakout import BreakoutStrategy
+from .supertrend import SuperTrendStrategy
+from .parabolic_sar import ParabolicSARStrategy
 
 ALL_STRATEGIES = [
     EMA5MomentumStrategy,           # 1 – Short-window EMA momentum     (~145% CAGR)
@@ -25,6 +27,8 @@ ALL_STRATEGIES = [
     MACDMomentumStrategy,           # 10 – MACD a favor de EMA 200       (clásica)
     EMACrossoverStrategy,           # 11 – Cruce EMA 9/21                (clásica)
     BreakoutStrategy,               # 12 – Ruptura con volumen           (clásica)
+    SuperTrendStrategy,             # 13 – SuperTrend con salida por giro (curso Axel)
+    ParabolicSARStrategy,           # 14 – Parabolic SAR con filtro EMA50 (curso Axel)
 ]
 # MLAdaptiveStrategy no se registra: solo aprende de trades cerrados en vivo y en un
 # backtest quedaría reducida a una regla fija; además lee/guarda un modelo en disco.
