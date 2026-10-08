@@ -24,6 +24,7 @@ class Exchange(str, Enum):
     """Supported exchanges."""
     COINBASE = "coinbase"
     KRAKEN = "kraken"
+    BINANCE = "binance"
 
 
 class VetoAction(str, Enum):
@@ -58,7 +59,7 @@ class Settings(BaseSettings):
     # Exchange Selection
     exchange: Exchange = Field(
         default=Exchange.COINBASE,
-        description="Exchange to use: coinbase or kraken"
+        description="Exchange to use: coinbase, kraken or binance"
     )
 
     # Coinbase API - can use either key file OR key+secret
@@ -83,6 +84,20 @@ class Settings(BaseSettings):
     kraken_api_secret: Optional[SecretStr] = Field(
         default=None,
         description="Kraken API secret (base64-encoded)"
+    )
+
+    # Binance API
+    binance_api_key: Optional[SecretStr] = Field(
+        default=None,
+        description="Binance API key"
+    )
+    binance_api_secret: Optional[SecretStr] = Field(
+        default=None,
+        description="Binance API secret"
+    )
+    binance_testnet: bool = Field(
+        default=True,
+        description="Use the Binance spot testnet (testnet.binance.vision). Keep true until live-ready."
     )
 
     # Trading Mode
@@ -1347,6 +1362,11 @@ class Settings(BaseSettings):
     def is_kraken(self) -> bool:
         """Check if using Kraken exchange."""
         return self.exchange == Exchange.KRAKEN
+
+    @property
+    def is_binance(self) -> bool:
+        """Check if using Binance exchange."""
+        return self.exchange == Exchange.BINANCE
 
 
 # Global settings instance (lazy loaded)

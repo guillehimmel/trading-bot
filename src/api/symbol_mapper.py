@@ -17,6 +17,7 @@ class Exchange(Enum):
 
     COINBASE = "coinbase"
     KRAKEN = "kraken"
+    BINANCE = "binance"
 
 
 # Kraken uses XBT instead of BTC
@@ -54,6 +55,9 @@ def normalize_symbol(symbol: str, exchange: Exchange) -> str:
     if exchange == Exchange.COINBASE:
         # Coinbase already uses our normalized format
         return symbol.upper()
+
+    if exchange == Exchange.BINANCE:
+        return normalize_binance_symbol(symbol)
 
     if exchange == Exchange.KRAKEN:
         # Handle XXBTZUSD format
@@ -94,6 +98,14 @@ def to_exchange_symbol(normalized: str, exchange: Exchange) -> str:
     if exchange == Exchange.COINBASE:
         # Coinbase uses our normalized format
         return normalized.upper()
+
+    if exchange == Exchange.BINANCE:
+        parts = normalized.upper().split("-")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid symbol format: {normalized}")
+        base, quote = parts
+        # Binance cotiza en stablecoins: USD -> USDT
+        return f"{base}{BINANCE_QUOTE_ALIASES.get(quote, quote)}"
 
     if exchange == Exchange.KRAKEN:
         # Parse normalized format
@@ -226,3 +238,46 @@ def to_kraken_granularity(granularity: str) -> int:
 def from_kraken_granularity(minutes: int) -> str:
     """Convert Kraken granularity to our format."""
     return KRAKEN_GRANULARITY_REVERSE.get(minutes, "ONE_HOUR")
+
+
+# --- Binance -----------------------------------------------------------------
+
+# Binance spot no tiene pares en USD: el equivalente es USDT.
+BINANCE_QUOTE_ALIASES = {"USD": "USDT"}
+
+# Quotes conocidas, de más larga a más corta para que el sufijo no sea ambiguo.
+BINANCE_QUOTES = ("FDUSD", "USDT", "USDC", "BUSD", "TUSD", "EUR", "GBP", "BTC", "ETH", "BNB")
+
+
+def normalize_binance_symbol(symbol: str) -> str:
+    """BTCUSDT -> BTC-USDT (los símbolos con separador se devuelven en mayúsculas)."""
+    symbol = symbol.upper()
+    if "-" in symbol:
+        return symbol
+    for quote in BINANCE_QUOTES:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return f"{symbol[: -len(quote)]}-{quote}"
+    raise ValueError(f"Cannot parse Binance symbol: {symbol}")
+
+
+# Granularidad interna -> intervalo de klines de Binance
+BINANCE_GRANULARITY_MAP = {
+    "ONE_MINUTE": "1m",
+    "FIVE_MINUTE": "5m",
+    "FIFTEEN_MINUTE": "15m",
+    "THIRTY_MINUTE": "30m",
+    "ONE_HOUR": "1h",
+    "TWO_HOUR": "2h",
+    "FOUR_HOUR": "4h",
+    "SIX_HOUR": "6h",
+    "ONE_DAY": "1d",
+    "ONE_WEEK": "1w",
+}
+
+
+def to_binance_interval(granularity: str) -> str:
+    """Convert our granularity format to a Binance klines interval."""
+    try:
+        return BINANCE_GRANULARITY_MAP[granularity.upper()]
+    except KeyError:
+        raise ValueError(f"Unsupported granularity for Binance: {granularity}") from None

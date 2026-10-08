@@ -931,7 +931,7 @@ def test_whale_volume_boundary_behavior():
 
     # Now spike the volume high enough to exceed 3.0 threshold
     # Using 5x ensures we're well above, accounting for rolling SMA including the spike
-    df['volume'].iloc[-1] = base_volume * 5
+    df.loc[df.index[-1], 'volume'] = base_volume * 5
     result2 = scorer.calculate_score(df)
     assert result2.breakdown.get("_whale_activity") == 1
     assert result2.breakdown.get("_volume_ratio") > 3.0

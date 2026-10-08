@@ -1,12 +1,13 @@
 """
 Exchange factory for creating the appropriate exchange client.
 
-Based on the EXCHANGE setting, creates either a Coinbase or Kraken client.
+Based on the EXCHANGE setting, creates a Coinbase, Kraken or Binance client.
 """
 
 import structlog
 
 from config.settings import Exchange, Settings, get_settings
+from src.api.binance_client import BinanceClient
 from src.api.coinbase_client import CoinbaseClient
 from src.api.exchange_protocol import ExchangeClient
 from src.api.kraken_client import KrakenClient
@@ -34,6 +35,8 @@ def create_exchange_client(settings: Settings | None = None) -> ExchangeClient:
         return _create_coinbase_client(settings)
     elif settings.exchange == Exchange.KRAKEN:
         return _create_kraken_client(settings)
+    elif settings.exchange == Exchange.BINANCE:
+        return _create_binance_client(settings)
     else:
         raise ValueError(f"Unsupported exchange: {settings.exchange}")
 
@@ -71,6 +74,22 @@ def _create_kraken_client(settings: Settings) -> KrakenClient:
     return KrakenClient(
         api_key=settings.kraken_api_key.get_secret_value(),
         api_secret=settings.kraken_api_secret.get_secret_value(),
+    )
+
+
+def _create_binance_client(settings: Settings) -> BinanceClient:
+    """Create a Binance client from settings."""
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise ValueError(
+            "Binance credentials not configured. "
+            "Set BINANCE_API_KEY and BINANCE_API_SECRET in your .env file"
+        )
+
+    logger.info("creating_binance_client", testnet=settings.binance_testnet)
+    return BinanceClient(
+        api_key=settings.binance_api_key.get_secret_value(),
+        api_secret=settings.binance_api_secret.get_secret_value(),
+        testnet=settings.binance_testnet,
     )
 
 

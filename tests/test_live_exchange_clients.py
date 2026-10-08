@@ -560,10 +560,42 @@ def test_exchange_factory_raises_on_unsupported_exchange():
     from config.settings import Settings
 
     mock_settings = Mock(spec=Settings)
-    mock_settings.exchange = "binance"  # Unsupported
+    mock_settings.exchange = "bitfinex"  # Unsupported
 
     with pytest.raises(ValueError, match="Unsupported exchange"):
         create_exchange_client(mock_settings)
+
+
+def test_exchange_factory_raises_without_binance_credentials():
+    """Test factory raises error when Binance credentials are missing."""
+    from src.api.exchange_factory import create_exchange_client
+    from config.settings import Settings, Exchange
+
+    mock_settings = Mock(spec=Settings)
+    mock_settings.exchange = Exchange.BINANCE
+    mock_settings.binance_api_key = None
+    mock_settings.binance_api_secret = None
+
+    with pytest.raises(ValueError, match="Binance credentials not configured"):
+        create_exchange_client(mock_settings)
+
+
+def test_exchange_factory_creates_binance_client_on_testnet_by_default():
+    """Test factory builds a BinanceClient and honours the testnet flag."""
+    from pydantic import SecretStr
+    from src.api.binance_client import TESTNET_URL, BinanceClient
+    from src.api.exchange_factory import create_exchange_client
+    from config.settings import Settings, Exchange
+
+    mock_settings = Mock(spec=Settings)
+    mock_settings.exchange = Exchange.BINANCE
+    mock_settings.binance_api_key = SecretStr("k")
+    mock_settings.binance_api_secret = SecretStr("s")
+    mock_settings.binance_testnet = True
+
+    client = create_exchange_client(mock_settings)
+    assert isinstance(client, BinanceClient)
+    assert client._base_url == TESTNET_URL
 
 
 # ============================================================================
