@@ -12,9 +12,9 @@ El punto más caro de un sistema así es mandarle a un LLM datos de mercado
 crudos (velas, order book) en cada ciclo. Dos decisiones lo mantienen barato:
 
 1. **Indicadores, no velas crudas** (`src/analysis/indicators.py`): las velas
-   se bajan de Binance y se resumen a ~10 números (ATR, RSI, medias, cambio %,
-   volumen relativo) en Python *antes* de llamar a Claude. Esto reduce el
-   payload por activo de ~20.000 tokens a ~150.
+   se bajan de Binance y se resumen a ~12 números (ATR, RSI, MACD, OBV, medias,
+   cambio %, volumen relativo) en Python *antes* de llamar a Claude. Esto
+   reduce el payload por activo de ~20.000 tokens a ~150.
 2. **Split de modelos**: Mercado, Riesgo y Noticias (que solo resumen datos)
    corren en Haiku 4.5 (`ANTHROPIC_MODEL_WORKER`, $1/$5 por MTok). Solo el CEO
    —la decisión final— corre en Sonnet 5 (`ANTHROPIC_MODEL_CEO`, $3/$15 por

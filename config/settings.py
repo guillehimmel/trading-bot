@@ -9,6 +9,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# Binance Spot Testnet (testnet.binance.vision) — plata falsa, mismo API que
+# producción. Separado a propósito del cliente de datos de mercado
+# (src/data/binance_client.py), que sigue pegándole al Binance real para que
+# el backtest use precios reales.
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+BINANCE_TESTNET_BASE_URL = "https://testnet.binance.vision"
+
+# "notify" (default): solo manda Telegram, no ejecuta nada — comportamiento
+# de siempre. "testnet": ejecuta de verdad contra Binance Spot Testnet (plata
+# falsa). Nunca agregamos un modo "live" por accidente acá — eso requiere una
+# decisión explícita del humano, no un valor más en una lista.
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "notify")
+
 # Modelo caro (razonamiento final) solo para el CEO. Modelo barato para los
 # departamentos que procesan datos (Mercado, Riesgo, Noticias) — ver costo en
 # README. Esto es lo que mantiene el bot dentro de un presupuesto chico/mes.
@@ -46,6 +60,21 @@ LIMIT_ORDER_EXPIRY_HOURS = float(os.environ.get("LIMIT_ORDER_EXPIRY_HOURS", "12"
 # tamaño calculado para una operación queda por debajo, se descarta — no tiene
 # sentido proponer una orden que no se puede ejecutar.
 MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10.0"))
+
+# Comisión taker de Binance spot por lado, sin descuento por pagar con BNB
+# (0.1% es el valor de lista — ver https://www.binance.com/en/fee/schedule).
+# Se cobra dos veces por trade (al abrir y al cerrar).
+FEE_PCT = float(os.environ.get("FEE_PCT", "0.1"))
+
+# Tope de concentración: aunque el riesgo calculado pida más (stop muy
+# ajustado), ninguna posición individual puede comprometer más de este % del
+# equity. Evita que una sola operación "use toda la cuenta".
+MAX_POSITION_NOTIONAL_PCT = float(os.environ.get("MAX_POSITION_NOTIONAL_PCT", "20.0"))
+
+# Kill-switch: si el equity cae este % por debajo del máximo histórico de la
+# cuenta, se dejan de abrir posiciones nuevas (las que ya están abiertas
+# siguen resolviéndose normal) hasta reactivarlo a mano.
+MAX_DRAWDOWN_PCT = float(os.environ.get("MAX_DRAWDOWN_PCT", "15.0"))
 
 PORTFOLIO_STATE_PATH = BASE_DIR / "state" / "portfolio.json"
 LESSONS_PATH = BASE_DIR / "state" / "lessons.md"

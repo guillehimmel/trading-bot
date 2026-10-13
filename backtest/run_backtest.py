@@ -43,8 +43,10 @@ from config.settings import (
     ANTHROPIC_MODEL_WORKER,
     CONTEXT_KLINES_LIMIT,
     CONTEXT_TIMEFRAME,
+    FEE_PCT,
     KLINES_LIMIT,
     LIMIT_ORDER_EXPIRY_HOURS,
+    MAX_DRAWDOWN_PCT,
     MAX_PORTFOLIO_RISK_PCT,
     MAX_RISK_PER_TRADE_PCT,
     MIN_RISK_REWARD,
@@ -97,6 +99,19 @@ class PortfolioSim:
         self.closed_trades: list[dict] = []
         self.rejected_trades: list[dict] = []
         self.expired_orders: list[dict] = []
+        self.kill_switch_rejections = 0
+
+    def capital_disponible(self) -> float:
+        """Efectivo libre: lo que no está ya comprometido en posiciones
+        abiertas. Sin esto, dos posiciones simultáneas podían cada una
+        calcularse contra el equity total, como si la plata se duplicara."""
+        comprometido = sum(p["notional"] for p in self.open_positions)
+        return max(0.0, self.equity - comprometido)
+
+    def kill_switch_active(self) -> bool:
+        if self.peak_equity <= 0:
+            return False
+        return self.equity <= self.peak_equity * (1 - MAX_DRAWDOWN_PCT / 100)
 
     def risk_input(self) -> dict:
         exposicion = sum(p["sized_pct"] for p in self.open_positions)
@@ -139,9 +154,14 @@ class PortfolioSim:
                 continue
 
             if pos["direccion"] == "long":
-                pnl = pos["quantity"] * (exit_price - pos["entry"])
+                pnl_gross = pos["quantity"] * (exit_price - pos["entry"])
             else:
-                pnl = pos["quantity"] * (pos["entry"] - exit_price)
+                pnl_gross = pos["quantity"] * (pos["entry"] - exit_price)
+
+            entry_notional = pos["quantity"] * pos["entry"]
+            exit_notional = pos["quantity"] * exit_price
+            fees = (entry_notional + exit_notional) * FEE_PCT / 100
+            pnl = pnl_gross - fees
             outcome = "win" if pnl >= 0 else "loss"
 
             self.equity += pnl
@@ -151,6 +171,8 @@ class PortfolioSim:
                 {
                     **pos,
                     "outcome": outcome,
+                    "pnl_gross": pnl_gross,
+                    "fees": fees,
                     "exit_reason": exit_reason,
                     "exit_price": exit_price,
                     "pnl": pnl,
@@ -200,8 +222,17 @@ class PortfolioSim:
         self.pending_orders = still_pending
 
     def _fill_order(self, order: dict, open_time: int) -> None:
+        if self.kill_switch_active():
+            self.kill_switch_rejections += 1
+            logger.warning(
+                "Orden de %s tocó el entry pero el kill-switch está activo (drawdown ≥ %.0f%%) — no se abren posiciones nuevas",
+                order["symbol"], MAX_DRAWDOWN_PCT,
+            )
+            return
+
         result = sizing.size_position(
             equity=self.equity,
+            capital_disponible=self.capital_disponible(),
             ceo_tamano_posicion_pct=order["tamano_posicion_pct"],
             riesgo_disponible_pct=order["riesgo_disponible_pct"],
             entry=order["entry"],
@@ -309,7 +340,13 @@ def run_backtest(days: int, pairs: list[str], output_path: Path) -> None:
                 logger.warning("[%d/%d] %s: agente falló (%s) — se registra como no_trade", i + 1, len(sim_open_times), iso_t, exc)
                 ceo_output = {"decision": "error", "motivo_no_trade": str(exc)}
 
-            if ceo_output["decision"] == "trade" and ceo_output.get("entry") is not None:
+            if ceo_output["decision"] == "trade" and portfolio.kill_switch_active():
+                portfolio.kill_switch_rejections += 1
+                logger.warning(
+                    "[%d/%d] %s: kill-switch activo (drawdown ≥ %.0f%%) — se descarta la propuesta de %s",
+                    i + 1, len(sim_open_times), iso_t, MAX_DRAWDOWN_PCT, ceo_output.get("symbol"),
+                )
+            elif ceo_output["decision"] == "trade" and ceo_output.get("entry") is not None:
                 portfolio.add_pending_order(ceo_output, riesgo_output.get("riesgo_disponible_pct", 0.0), t)
             elif ceo_output["decision"] == "trade":
                 logger.warning("[%d/%d] %s: CEO pidió trade sin 'entry', se descarta", i + 1, len(sim_open_times), iso_t)
@@ -375,10 +412,14 @@ def write_trades_log(trades: list[dict], output_path: Path) -> None:
         "outcome",
         "exit_reason",
         "exit_price",
+        "pnl_gross",
+        "fees",
         "pnl",
         "opened_at",
         "closed_at",
         "duration_hours",
+        "razonamiento",
+        "conflictos_resueltos",
     ]
     rows = [
         {
@@ -412,6 +453,9 @@ def print_summary(portfolio: PortfolioSim, days: int) -> None:
     print(f"Trades cerrados: {len(trades)} (wins={len(wins)}, losses={len(losses)})")
     if trades:
         print(f"Win rate: {len(wins) / len(trades) * 100:.1f}%")
+        total_fees = sum(t["fees"] for t in trades)
+        total_pnl_gross = sum(t["pnl_gross"] for t in trades)
+        print(f"PnL bruto: {total_pnl_gross:+.2f} | Comisiones pagadas: -{total_fees:.2f} ({FEE_PCT}%/lado) | PnL neto: {(total_pnl_gross - total_fees):+.2f}")
     if wins:
         avg_win_h = sum(t["duration_hours"] for t in wins) / len(wins)
         print(f"Duración media hasta TP: {avg_win_h:.1f}h")
@@ -429,6 +473,8 @@ def print_summary(portfolio: PortfolioSim, days: int) -> None:
         print(f"Órdenes límite expiradas sin tocar el entry: {len(portfolio.expired_orders)}")
     if portfolio.pending_orders:
         print(f"Órdenes límite todavía pendientes al cierre de la ventana: {len(portfolio.pending_orders)}")
+    if portfolio.kill_switch_rejections:
+        print(f"Propuestas descartadas por kill-switch (drawdown ≥ {MAX_DRAWDOWN_PCT:.0f}%): {portfolio.kill_switch_rejections}")
 
     usage = runner.get_usage_summary()
     print("\n=== Gasto real en la API (Anthropic) ===")
