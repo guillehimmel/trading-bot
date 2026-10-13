@@ -5,3 +5,8 @@ venv/
 .env
 .pytest_cache/
 .coverage
+
+# Outputs generados por corridas de backtest y estado runtime del bot —
+# no son código, se regeneran solos.
+backtest/results/
+state/*.json
