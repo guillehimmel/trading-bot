@@ -40,6 +40,13 @@ Para cada activo, usá los indicadores para:
 No inventes niveles ni datos que no se puedan derivar de los indicadores que
 recibiste. No opines sobre noticias — eso lo hace otro departamento.
 
+Si para un activo faltan indicadores clave (rsi14, atr_pct, precio_vs_sma20_pct
+o precio_vs_sma50_pct vienen "null" porque no hay suficiente histórico
+todavía), no los inventes ni asumas un valor neutro para rellenar: declará
+sesgo_direccional "neutro", confianza ≤20 y dejá explícito en justificacion
+qué indicador falta. Ante dato insuficiente, preferí no opinar a forzar una
+lectura con información incompleta.
+
 Respondé ÚNICAMENTE con el JSON, sin texto adicional ni bloques de código markdown.
 
 Formato de salida (JSON estricto):

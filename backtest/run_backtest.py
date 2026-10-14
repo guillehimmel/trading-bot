@@ -451,17 +451,37 @@ def print_summary(portfolio: PortfolioSim, days: int) -> None:
     print(f"Ventana: {days} días")
     print(f"Equity inicial: {ACCOUNT_EQUITY_USD:.2f} -> final: {portfolio.equity:.2f} ({total_return_pct:+.2f}%)")
     print(f"Trades cerrados: {len(trades)} (wins={len(wins)}, losses={len(losses)})")
+    net_pnl = None
     if trades:
         print(f"Win rate: {len(wins) / len(trades) * 100:.1f}%")
         total_fees = sum(t["fees"] for t in trades)
         total_pnl_gross = sum(t["pnl_gross"] for t in trades)
-        print(f"PnL bruto: {total_pnl_gross:+.2f} | Comisiones pagadas: -{total_fees:.2f} ({FEE_PCT}%/lado) | PnL neto: {(total_pnl_gross - total_fees):+.2f}")
+        net_pnl = total_pnl_gross - total_fees
+        print(f"PnL bruto: {total_pnl_gross:+.2f} | Comisiones pagadas: -{total_fees:.2f} ({FEE_PCT}%/lado) | PnL neto: {net_pnl:+.2f}")
+    # Lo que importa es la plata neta, no el win rate aislado: un win rate alto
+    # con pérdidas grandes (o un solo trade tapando el resto) puede ser una mala
+    # estrategia igual. Estas métricas lo hacen visible.
+    avg_win_usd = biggest_win_usd = None
     if wins:
         avg_win_h = sum(t["duration_hours"] for t in wins) / len(wins)
+        avg_win_usd = sum(t["pnl"] for t in wins) / len(wins)
+        biggest_win_usd = max(t["pnl"] for t in wins)
         print(f"Duración media hasta TP: {avg_win_h:.1f}h")
+        print(f"Ganancia neta media por win: {avg_win_usd:+.2f} | Mayor win individual: {biggest_win_usd:+.2f}")
+    avg_loss_usd = None
     if losses:
         avg_loss_h = sum(t["duration_hours"] for t in losses) / len(losses)
+        avg_loss_usd = sum(t["pnl"] for t in losses) / len(losses)
+        biggest_loss_usd = min(t["pnl"] for t in losses)
         print(f"Duración media hasta SL: {avg_loss_h:.1f}h")
+        print(f"Pérdida neta media por loss: {avg_loss_usd:+.2f} | Mayor loss individual: {biggest_loss_usd:+.2f}")
+    if avg_win_usd is not None and avg_loss_usd:
+        payoff_ratio = avg_win_usd / abs(avg_loss_usd)
+        print(f"Payoff ratio (ganancia media / pérdida media): {payoff_ratio:.2f}")
+    if net_pnl is not None and net_pnl > 0 and biggest_win_usd is not None:
+        concentracion_pct = biggest_win_usd / net_pnl * 100
+        alerta = " (⚠ un solo trade está tapando el resultado del resto de la estrategia)" if concentracion_pct > 50 else ""
+        print(f"Concentración: el mayor win individual explica el {concentracion_pct:.1f}% del PnL neto total{alerta}")
     time_stopped = [t for t in trades if t.get("exit_reason") == "time_stop"]
     if time_stopped:
         print(f"Cerrados por time-stop (no tocaron SL ni TP): {len(time_stopped)}")
