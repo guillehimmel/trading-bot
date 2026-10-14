@@ -70,6 +70,7 @@ def main() -> None:
             "status": "closed",
             "outcome": t["outcome"],
             "pnl": float(t["pnl"]),
+            "fees": float(t["fees"]),
             "duration_hours": float(t["duration_hours"]),
             "opened_at": opened_ms,
             "closed_at": closed_ms,
